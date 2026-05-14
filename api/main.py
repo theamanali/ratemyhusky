@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 import psycopg2.extras
+import os
 
 app = FastAPI()
 
@@ -12,10 +13,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_URL = "postgresql://localhost/uw_professors"
-
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    url = os.environ["DATABASE_URL"]
+    return psycopg2.connect(url, sslmode="require", cursor_factory=psycopg2.extras.RealDictCursor)
 
 @app.get("/schools")
 def get_schools():
