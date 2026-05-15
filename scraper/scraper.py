@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import time
@@ -17,9 +16,9 @@ HEADERS = {
     "Origin": RMP_BASE_URL,
 }
 SCHOOLS = [
-    {"id": "U2Nob29sLTE1MzA=",  "name": "UW Seattle"},
-    {"id": "U2Nob29sLTQ0NjY=",  "name": "UW Bothell"},
-    {"id": "U2Nob29sLTQ3NDQ=",  "name": "UW Tacoma"},
+    {"id": "U2Nob29sLTE1MzA=", "name": "UW Seattle"},
+    {"id": "U2Nob29sLTQ0NjY=", "name": "UW Bothell"},
+    {"id": "U2Nob29sLTQ3NDQ=", "name": "UW Tacoma"},
 ]
 PROF_BATCH_SIZE = 1000
 RATINGS_BATCH_SIZE = 1000
@@ -37,7 +36,7 @@ def init_db(db_conn):
         )
     """)
     db_cur.execute("""
-        CREATE TABLE IF NOT EXISTS professors (
+        CREATE TABLE IF NOT EXISTS rmp_professors_raw (
             id TEXT PRIMARY KEY,
             school_id TEXT,
             first_name TEXT,
@@ -47,16 +46,11 @@ def init_db(db_conn):
             avg_difficulty REAL,
             num_ratings INTEGER,
             would_take_again REAL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            grade_distribution TEXT DEFAULT NULL,
-            rating_distribution TEXT DEFAULT NULL,
-            difficulty_distribution TEXT DEFAULT NULL,
-            courses TEXT DEFAULT NULL,
-            FOREIGN KEY (school_id) REFERENCES schools(id)
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     db_cur.execute("""
-        CREATE TABLE IF NOT EXISTS ratings (
+        CREATE TABLE IF NOT EXISTS rmp_ratings_raw (
             id TEXT PRIMARY KEY,
             professor_id TEXT,
             class TEXT,
@@ -67,12 +61,12 @@ def init_db(db_conn):
             difficulty_rating INTEGER,
             grade TEXT,
             would_take_again INTEGER,
-            is_online BOOLEAN,
-            FOREIGN KEY (professor_id) REFERENCES professors(id)
+            is_online BOOLEAN
         )
     """)
     db_conn.commit()
     db_cur.close()
+
 
 def post_with_retry(query):
     for attempt in range(1, MAX_RETRIES + 1):
@@ -86,6 +80,7 @@ def post_with_retry(query):
         time.sleep(RETRY_DELAY)
     print(f"    All {MAX_RETRIES} attempts failed, skipping batch")
     return None
+
 
 def fetch_professors_page(school_id, page_cursor=None):
     after = f', after: "{page_cursor}"' if page_cursor else ""
@@ -106,6 +101,7 @@ def fetch_professors_page(school_id, page_cursor=None):
     """)
     return response["data"]["newSearch"]["teachers"] if response else None
 
+
 def fetch_ratings_batch(professor_ids):
     aliases = "\n".join([
         f"""p{idx}: node(id: "{prof_id}") {{
@@ -125,47 +121,6 @@ def fetch_ratings_batch(professor_ids):
     ])
     return post_with_retry(f"query {{ {aliases} }}")
 
-GRADE_KEYS = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C", "C-", "D+", "D", "D-", "F", "Rather not say", "Not sure yet"]
-
-def compute_professor_derived(prof_ratings):
-    if not prof_ratings:
-        return (
-            json.dumps({g: 0 for g in GRADE_KEYS}),
-            json.dumps({"1":0,"2":0,"3":0,"4":0,"5":0}),
-            json.dumps({"1":0,"2":0,"3":0,"4":0,"5":0}),
-            json.dumps([]),
-        )
-
-    grade_counts = {g: 0 for g in GRADE_KEYS}
-    rating_counts = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
-    diff_counts = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
-    course_counts = {}
-
-    for rating in prof_ratings:
-        grade = rating["grade"] if rating["grade"] in grade_counts else None
-        if grade:
-            grade_counts[grade] += 1
-
-        hr = rating["helpful_rating"]
-        if hr and 1 <= hr <= 5:
-            rating_counts[str(hr)] += 1
-
-        dr = rating["difficulty_rating"]
-        if dr and 1 <= dr <= 5:
-            diff_counts[str(dr)] += 1
-
-        course = (rating["class"] or "").strip()
-        if course:
-            course_counts[course] = course_counts.get(course, 0) + 1
-
-    courses_list = [{"code": k, "count": v} for k, v in course_counts.items()]
-
-    return (
-        json.dumps(grade_counts),
-        json.dumps(rating_counts),
-        json.dumps(diff_counts),
-        json.dumps(courses_list),
-    )
 
 # --- Main ---
 conn = psycopg2.connect(DB_URL, sslmode="require")
@@ -209,7 +164,7 @@ try:
         # Compare fetched professors against DB to find new/changed ones
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, num_ratings FROM professors WHERE id = ANY(%s)",
+            "SELECT id, num_ratings FROM rmp_professors_raw WHERE id = ANY(%s)",
             ([p["id"] for p in professors],)
         )
         existing = {row[0]: row[1] for row in cur.fetchall()}
@@ -228,7 +183,7 @@ try:
         if any_changes:
             cur = conn.cursor()
             psycopg2.extras.execute_values(cur, """
-                INSERT INTO professors (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again)
+                INSERT INTO rmp_professors_raw (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again)
                 VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     avg_rating = EXCLUDED.avg_rating,
@@ -247,7 +202,7 @@ try:
             cur.close()
             print(f"  Done: Saved {len(new_prof_ids)} new professors, Found {len(changed_prof_ids)} professors with new ratings")
         else:
-            print("  No new professors or ratings — skipping steps 2 and 3.")
+            print("  No new professors or ratings — skipping step 2.")
 
         if any_changes:
             # Step 2: fetch ratings for professors with new ratings
@@ -286,7 +241,7 @@ try:
 
                 cur = conn.cursor()
                 psycopg2.extras.execute_values(cur, """
-                    INSERT INTO ratings
+                    INSERT INTO rmp_ratings_raw
                     (id, professor_id, class, date, comment, clarity_rating, helpful_rating,
                      difficulty_rating, grade, would_take_again, is_online)
                     VALUES %s
@@ -301,49 +256,6 @@ try:
                 time.sleep(0.5)
 
             print(f"  Done: Inserted {total_ratings} new rating(s) across {len(changed_prof_ids)} professor(s)")
-
-            if total_ratings == 0 and not FORCE:
-                print("  No new ratings inserted — skipping step 3.")
-            else:
-                # Step 3: compute derived columns for changed professors
-                print("Step 3: Computing derived professor columns...")
-                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                cur.execute("""
-                    SELECT professor_id, helpful_rating, difficulty_rating, grade, class
-                    FROM ratings WHERE professor_id = ANY(%s)
-                """, (list(changed_prof_ids),))
-                all_ratings = cur.fetchall()
-                cur.close()
-
-                ratings_by_prof = {}
-                for prof_rating in all_ratings:
-                    prof_key = prof_rating["professor_id"]
-                    if prof_key not in ratings_by_prof:
-                        ratings_by_prof[prof_key] = []
-                    ratings_by_prof[prof_key].append(prof_rating)
-
-                updates = []
-                for prof_id in changed_prof_ids:
-                    derived = compute_professor_derived(ratings_by_prof.get(prof_id, []))
-                    updates.append((*derived, prof_id))
-
-                cur = conn.cursor()
-                psycopg2.extras.execute_values(cur, """
-                    UPDATE professors SET
-                        grade_distribution      = data.grade_distribution,
-                        rating_distribution     = data.rating_distribution,
-                        difficulty_distribution = data.difficulty_distribution,
-                        courses                 = data.courses
-                    FROM (VALUES %s) AS data(
-                        grade_distribution, rating_distribution, difficulty_distribution,
-                        courses, id
-                    )
-                    WHERE professors.id = data.id
-                """, updates)
-                conn.commit()
-                cur.close()
-
-                print(f"  Done: Recomputed derived stats for {len(changed_prof_ids)} professor(s)")
 
 finally:
     conn.close()
