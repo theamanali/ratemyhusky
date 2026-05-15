@@ -228,7 +228,9 @@ try:
                     updated_at = CURRENT_TIMESTAMP
             """, [(
                 p["id"], school["id"], p["firstName"], p["lastName"],
-                p["department"], p["avgRating"], p["avgDifficulty"],
+                p["department"],
+                p["avgRating"] if p["numRatings"] > 0 else -1,
+                p["avgDifficulty"] if p["numRatings"] > 0 else -1,
                 p["numRatings"], p["wouldTakeAgainPercent"],
             ) for p in professors])
             conn.commit()
