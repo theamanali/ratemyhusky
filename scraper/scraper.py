@@ -1,20 +1,20 @@
-import requests
-import psycopg2
-import psycopg2.extras
-import time
-import os
 import json
+import os
 import sys
+import time
+import psycopg2.extras
+import requests
 
 FORCE = "--force" in sys.argv
 
-GRAPHQL_URL = "https://www.ratemyprofessors.com/graphql"
+RMP_BASE_URL = "https://www.ratemyprofessors.com"
+GRAPHQL_URL = f"{RMP_BASE_URL}/graphql"
 HEADERS = {
     "Authorization": "Basic dGVzdDp0ZXN0",
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.ratemyprofessors.com/",
-    "Origin": "https://www.ratemyprofessors.com",
+    "Referer": f"{RMP_BASE_URL}/",
+    "Origin": RMP_BASE_URL,
 }
 SCHOOLS = [
     {"id": "U2Nob29sLTE1MzA=",  "name": "UW Seattle"},
@@ -28,15 +28,15 @@ RETRY_DELAY = 2
 DB_URL = os.environ["DATABASE_URL"]
 
 
-def init_db(conn):
-    cur = conn.cursor()
-    cur.execute("""
+def init_db(db_conn):
+    db_cur = db_conn.cursor()
+    db_cur.execute("""
         CREATE TABLE IF NOT EXISTS schools (
             id TEXT PRIMARY KEY,
             name TEXT
         )
     """)
-    cur.execute("""
+    db_cur.execute("""
         CREATE TABLE IF NOT EXISTS professors (
             id TEXT PRIMARY KEY,
             school_id TEXT,
@@ -55,7 +55,7 @@ def init_db(conn):
             FOREIGN KEY (school_id) REFERENCES schools(id)
         )
     """)
-    cur.execute("""
+    db_cur.execute("""
         CREATE TABLE IF NOT EXISTS ratings (
             id TEXT PRIMARY KEY,
             professor_id TEXT,
@@ -71,8 +71,8 @@ def init_db(conn):
             FOREIGN KEY (professor_id) REFERENCES professors(id)
         )
     """)
-    conn.commit()
-    cur.close()
+    db_conn.commit()
+    db_cur.close()
 
 def post_with_retry(query):
     for attempt in range(1, MAX_RETRIES + 1):
@@ -87,9 +87,9 @@ def post_with_retry(query):
     print(f"    All {MAX_RETRIES} attempts failed, skipping batch")
     return None
 
-def fetch_professors_page(school_id, cursor=None):
-    after = f', after: "{cursor}"' if cursor else ""
-    data = post_with_retry(f"""
+def fetch_professors_page(school_id, page_cursor=None):
+    after = f', after: "{page_cursor}"' if page_cursor else ""
+    response = post_with_retry(f"""
     query {{
         newSearch {{
             teachers(query: {{ schoolID: "{school_id}" }}, first: {PROF_BATCH_SIZE}{after}) {{
@@ -104,11 +104,11 @@ def fetch_professors_page(school_id, cursor=None):
         }}
     }}
     """)
-    return data["data"]["newSearch"]["teachers"] if data else None
+    return response["data"]["newSearch"]["teachers"] if response else None
 
 def fetch_ratings_batch(professor_ids):
     aliases = "\n".join([
-        f"""p{i}: node(id: "{pid}") {{
+        f"""p{idx}: node(id: "{prof_id}") {{
             ... on Teacher {{
                 ratings(first: 1000) {{
                     edges {{
@@ -121,14 +121,14 @@ def fetch_ratings_batch(professor_ids):
                 }}
             }}
         }}"""
-        for i, pid in enumerate(professor_ids)
+        for idx, prof_id in enumerate(professor_ids)
     ])
     return post_with_retry(f"query {{ {aliases} }}")
 
 GRADE_KEYS = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C", "C-", "D+", "D", "D-", "F", "Rather not say", "Not sure yet"]
 
-def compute_professor_derived(ratings):
-    if not ratings:
+def compute_professor_derived(prof_ratings):
+    if not prof_ratings:
         return (
             json.dumps({g: 0 for g in GRADE_KEYS}),
             json.dumps({"1":0,"2":0,"3":0,"4":0,"5":0}),
@@ -141,22 +141,22 @@ def compute_professor_derived(ratings):
     diff_counts = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
     course_counts = {}
 
-    for r in ratings:
-        g = r["grade"] if r["grade"] in grade_counts else None
-        if g:
-            grade_counts[g] += 1
+    for rating in prof_ratings:
+        grade = rating["grade"] if rating["grade"] in grade_counts else None
+        if grade:
+            grade_counts[grade] += 1
 
-        hr = r["helpful_rating"]
+        hr = rating["helpful_rating"]
         if hr and 1 <= hr <= 5:
             rating_counts[str(hr)] += 1
 
-        dr = r["difficulty_rating"]
+        dr = rating["difficulty_rating"]
         if dr and 1 <= dr <= 5:
             diff_counts[str(dr)] += 1
 
-        c = (r["class"] or "").strip()
-        if c:
-            course_counts[c] = course_counts.get(c, 0) + 1
+        course = (rating["class"] or "").strip()
+        if course:
+            course_counts[course] = course_counts.get(course, 0) + 1
 
     courses_list = [{"code": k, "count": v} for k, v in course_counts.items()]
 
@@ -188,21 +188,21 @@ try:
         # Step 1: fetch all professors
         print("Step 1: Fetching professor info...")
         professors = []
-        cursor = None
+        page_cursor = None
         page = 1
         while True:
             start = time.time()
-            data = fetch_professors_page(school["id"], cursor)
+            page_data = fetch_professors_page(school["id"], page_cursor)
             elapsed = time.time() - start
-            if not data:
+            if not page_data:
                 print("  Failed to fetch page, aborting")
                 break
-            batch = [e["node"] for e in data["edges"]]
+            batch = [e["node"] for e in page_data["edges"]]
             professors.extend(batch)
             print(f"  Page {page}: {len(batch)} professors (total: {len(professors)}) in {elapsed:.2f}s")
-            if not data["pageInfo"]["hasNextPage"]:
+            if not page_data["pageInfo"]["hasNextPage"]:
                 break
-            cursor = data["pageInfo"]["endCursor"]
+            page_cursor = page_data["pageInfo"]["endCursor"]
             page += 1
             time.sleep(0.5)
 
@@ -221,7 +221,7 @@ try:
         else:
             changed_prof_ids = {
                 p["id"] for p in professors
-                if p["numRatings"] > 0 and existing.get(p["id"]) != p["numRatings"]
+                if 0 < p["numRatings"] != existing.get(p["id"])
             }
         any_changes = new_prof_ids or changed_prof_ids
 
@@ -261,27 +261,27 @@ try:
                 batch_num = (i // RATINGS_BATCH_SIZE) + 1
 
                 start = time.time()
-                data = fetch_ratings_batch(batch_ids)
+                batch_response = fetch_ratings_batch(batch_ids)
 
-                if not data:
+                if not batch_response:
                     print(f"  Batch {batch_num}/{total_batches}: SKIPPED after retries")
                     changed_prof_ids -= set(batch_ids)
                     continue
 
-                ratings = []
-                for key, val in data.get("data", {}).items():
-                    if not val or "ratings" not in val:
+                new_ratings = []
+                for alias, teacher in batch_response.get("data", {}).items():
+                    if not teacher or "ratings" not in teacher:
                         continue
-                    idx = int(key[1:])
-                    if idx >= len(batch_ids):
+                    alias_idx = int(alias[1:])
+                    if alias_idx >= len(batch_ids):
                         continue
-                    prof_id = batch_ids[idx]
-                    for e in val["ratings"]["edges"]:
-                        n = e["node"]
-                        ratings.append((
-                            n["id"], prof_id, n["class"], n["date"], n["comment"],
-                            n["clarityRating"], n["helpfulRating"], n["difficultyRating"],
-                            n["grade"], n["wouldTakeAgain"], n["isForOnlineClass"],
+                    batch_prof_id = batch_ids[alias_idx]
+                    for edge in teacher["ratings"]["edges"]:
+                        node = edge["node"]
+                        new_ratings.append((
+                            node["id"], batch_prof_id, node["class"], node["date"], node["comment"],
+                            node["clarityRating"], node["helpfulRating"], node["difficultyRating"],
+                            node["grade"], node["wouldTakeAgain"], node["isForOnlineClass"],
                         ))
 
                 cur = conn.cursor()
@@ -291,7 +291,7 @@ try:
                      difficulty_rating, grade, would_take_again, is_online)
                     VALUES %s
                     ON CONFLICT (id) DO NOTHING
-                """, ratings)
+                """, new_ratings)
                 inserted = cur.rowcount
                 conn.commit()
                 cur.close()
@@ -316,11 +316,11 @@ try:
                 cur.close()
 
                 ratings_by_prof = {}
-                for r in all_ratings:
-                    pid = r["professor_id"]
-                    if pid not in ratings_by_prof:
-                        ratings_by_prof[pid] = []
-                    ratings_by_prof[pid].append(r)
+                for prof_rating in all_ratings:
+                    prof_key = prof_rating["professor_id"]
+                    if prof_key not in ratings_by_prof:
+                        ratings_by_prof[prof_key] = []
+                    ratings_by_prof[prof_key].append(prof_rating)
 
                 updates = []
                 for prof_id in changed_prof_ids:
