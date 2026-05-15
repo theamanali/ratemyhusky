@@ -302,7 +302,7 @@ try:
 
             print(f"  Done: Inserted {total_ratings} new rating(s) across {len(changed_prof_ids)} professor(s)")
 
-            if total_ratings == 0:
+            if total_ratings == 0 and not FORCE:
                 print("  No new ratings inserted — skipping step 3.")
             else:
                 # Step 3: compute derived columns for changed professors
