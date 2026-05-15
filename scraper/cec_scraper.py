@@ -161,6 +161,8 @@ async def scrape_all(context, links, existing_urls):
 
     print(render_bar(0, total, 0), end="", flush=True)
 
+    failed = []
+
     async def scrape_one(link):
         nonlocal completed
         async with sem:
@@ -170,8 +172,8 @@ async def scrape_all(context, links, existing_urls):
                 result = await parse_evaluation_page(eval_page, href)
                 await eval_page.close()
                 scraped.append(result)
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append((href, str(e)))
             completed += 1
             print(f"\r{render_bar(completed, total, time.monotonic() - start)}", end="", flush=True)
 
@@ -179,6 +181,11 @@ async def scrape_all(context, links, existing_urls):
     elapsed = time.monotonic() - start
     avg = elapsed / total if total > 0 else 0
     print(f"\nDone in {fmt_time(elapsed)} — {avg:.2f}s avg per page")
+
+    if failed:
+        print(f"\n{len(failed)} failed:")
+        for url, err in failed:
+            print(f"  {url.split('/')[-1]}: {err}")
 
     print("Saving to DB...", end="", flush=True)
     save_to_db(scraped)

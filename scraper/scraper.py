@@ -194,9 +194,9 @@ try:
             """, [(
                 p["id"], school["id"], p["firstName"], p["lastName"],
                 p["department"],
-                p["avgRating"] if p["numRatings"] > 0 else -1,
-                p["avgDifficulty"] if p["numRatings"] > 0 else -1,
-                p["numRatings"], p["wouldTakeAgainPercent"],
+                p["avgRating"] if p["numRatings"] > 0 else None,
+                p["avgDifficulty"] if p["numRatings"] > 0 else None,
+                p["numRatings"], p["wouldTakeAgainPercent"] if p["wouldTakeAgainPercent"] != -1 else None,
             ) for p in professors])
             conn.commit()
             cur.close()
