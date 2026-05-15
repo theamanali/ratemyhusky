@@ -206,9 +206,11 @@ async def main():
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto(TOC_URL)
-        print("\nBrowser opened. Please log in with your UW NetID.")
-        print("Press Enter once you can see the Table of Contents page...")
-        await asyncio.get_event_loop().run_in_executor(None, input)
+        print("\nBrowser opened. Please log in with your UW NetID...")
+
+        # Wait for the TOC page to load (user completes login + 2FA)
+        await page.wait_for_url(TOC_URL, timeout=300_000)
+        print("Authenticated! Switching to headless browser...")
 
         # Transfer session cookies to a headless browser
         cookies = await context.cookies()
