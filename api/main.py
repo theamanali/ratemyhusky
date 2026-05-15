@@ -24,7 +24,7 @@ app = FastAPI(
         "(Seattle, Bothell, Tacoma), sourced from RateMyProfessors.\n\n"
         "**Rate limits:** Search endpoints are limited to 30 requests/minute per IP. "
         "All other endpoints are limited to 60 requests/minute per IP.\n\n"
-        "**Note:** `avg_rating` and `avg_difficulty` are `-1` for professors with no ratings."
+        "**Note:** `avg_rating` and `avg_difficulty` are `null` for professors with no ratings."
     ),
     version="1.0.0",
 )
@@ -57,7 +57,10 @@ def db_cursor():
     conn = pool.getconn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        yield cur
+        try:
+            yield cur
+        finally:
+            cur.close()
     finally:
         pool.putconn(conn)
 
@@ -96,7 +99,7 @@ def health(request: Request):
 def get_schools(request: Request):
     """Returns all UW campuses. Use the returned `id` as `school_id` in other endpoints."""
     with db_cursor() as cur:
-        cur.execute("SELECT * FROM schools ORDER BY name")
+        cur.execute("SELECT * FROM schools WHERE rmp_id IS NOT NULL ORDER BY name")
         return cur.fetchall()
 
 
@@ -104,20 +107,28 @@ def get_schools(request: Request):
 @limiter.limit("60/minute")
 def get_departments(
     request: Request,
-    school_id: str = Query(None, description="Filter departments by school ID"),
+    school: str = Query(None, description="Filter departments by school name (e.g. 'UW Seattle')"),
 ):
     """Returns a list of all unique department names, optionally scoped to a school."""
     with db_cursor() as cur:
-        if school_id:
+        if school:
             cur.execute(
-                "SELECT DISTINCT department FROM professors "
-                "WHERE school_id = %s AND department IS NOT NULL ORDER BY department",
-                (school_id,),
+                """
+                SELECT DISTINCT jsonb_array_elements_text(departments) AS department
+                FROM professors
+                WHERE school = %s AND departments IS NOT NULL
+                ORDER BY department
+                """,
+                (school,),
             )
         else:
             cur.execute(
-                "SELECT DISTINCT department FROM professors "
-                "WHERE department IS NOT NULL ORDER BY department"
+                """
+                SELECT DISTINCT jsonb_array_elements_text(departments) AS department
+                FROM professors
+                WHERE departments IS NOT NULL
+                ORDER BY department
+                """
             )
         return [r["department"] for r in cur.fetchall()]
 
@@ -126,7 +137,7 @@ def get_departments(
 @limiter.limit("60/minute")
 def get_professors(
     request: Request,
-    school_id: str = Query(None, description="Filter by school ID"),
+    school: str = Query(None, description="Filter by school name (e.g. 'UW Seattle')"),
     department: str = Query(None, description="Filter by department name (partial match)"),
     min_ratings: int = Query(0, description="Minimum number of ratings"),
     min_rating: float = Query(None, description="Minimum average rating (1-5)"),
@@ -139,7 +150,7 @@ def get_professors(
     """
     Returns a paginated list of professors with optional filtering and sorting.
 
-    Professors with no ratings have `avg_rating` and `avg_difficulty` set to `-1`.
+    Professors with no ratings have `avg_rating` and `avg_difficulty` set to `null`.
     """
     if sort_by not in VALID_SORT_COLS:
         raise HTTPException(status_code=400, detail=f"sort_by must be one of {VALID_SORT_COLS}")
@@ -149,11 +160,11 @@ def get_professors(
 
     filters = ["num_ratings >= %s"]
     params = [min_ratings]
-    if school_id:
-        filters.append("school_id = %s")
-        params.append(school_id)
+    if school:
+        filters.append("school = %s")
+        params.append(school)
     if department:
-        filters.append("department ILIKE %s")
+        filters.append("departments::text ILIKE %s")
         params.append(f"%{department}%")
     if min_rating is not None:
         filters.append("avg_rating >= %s")
@@ -183,7 +194,7 @@ def get_professors(
 def search_professors(
     request: Request,
     name: str = Query(..., min_length=2, description="Professor name (first last, last first, or with middle name)"),
-    school_id: str = Query(None, description="Scope search to a specific school"),
+    school: str = Query(None, description="Scope search to a specific school (e.g. 'UW Seattle')"),
     limit: int = Query(10, description="Number of results (max 50)"),
 ):
     """
@@ -206,9 +217,9 @@ def search_professors(
         " OR LOWER(last_name || ' ' || first_name) LIKE %s)"
     ]
     params = [pattern, pattern]
-    if school_id:
-        filters.append("school_id = %s")
-        params.append(school_id)
+    if school:
+        filters.append("school = %s")
+        params.append(school)
 
     where = " AND ".join(filters)
     with db_cursor() as cur:
@@ -221,8 +232,8 @@ def search_professors(
 
 @app.get("/professors/{professor_id}", tags=["Professors"], summary="Get a professor by ID")
 @limiter.limit("60/minute")
-def get_professor(request: Request, professor_id: str):
-    """Returns a single professor record by their RMP ID."""
+def get_professor(request: Request, professor_id: int):
+    """Returns a single professor record by their numeric ID."""
     with db_cursor() as cur:
         cur.execute("SELECT * FROM professors WHERE id = %s", (professor_id,))
         professor = cur.fetchone()
@@ -235,20 +246,24 @@ def get_professor(request: Request, professor_id: str):
 @limiter.limit("30/minute")
 def get_ratings(
     request: Request,
-    professor_id: str,
+    professor_id: int,
     limit: int = Query(50, ge=1, le=200, description="Number of ratings (max 200)"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
 ):
     """Returns paginated student ratings for a professor, ordered by date descending."""
     with db_cursor() as cur:
-        cur.execute("SELECT id FROM professors WHERE id = %s", (professor_id,))
-        if not cur.fetchone():
+        cur.execute("SELECT rmp_id FROM professors WHERE id = %s", (professor_id,))
+        prof = cur.fetchone()
+        if not prof:
             raise HTTPException(status_code=404, detail="Professor not found")
-        cur.execute("SELECT COUNT(*) FROM ratings WHERE professor_id = %s", (professor_id,))
+        rmp_id = prof["rmp_id"]
+        if not rmp_id:
+            return paginate([], 0, limit, offset)
+        cur.execute("SELECT COUNT(*) FROM rmp_ratings_raw WHERE professor_id = %s", (rmp_id,))
         total = cur.fetchone()["count"]
         cur.execute(
-            "SELECT * FROM ratings WHERE professor_id = %s ORDER BY date DESC LIMIT %s OFFSET %s",
-            (professor_id, limit, offset),
+            "SELECT * FROM rmp_ratings_raw WHERE professor_id = %s ORDER BY date DESC LIMIT %s OFFSET %s",
+            (rmp_id, limit, offset),
         )
         ratings = cur.fetchall()
     return paginate(ratings, total, limit, offset)

@@ -57,9 +57,63 @@ def compute_derived(ratings):
     )
 
 
+def init_db(conn):
+    cur = conn.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS professors (
+            id SERIAL PRIMARY KEY,
+            rmp_id TEXT UNIQUE,
+            cec_id TEXT,
+            school TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            departments JSONB,
+            avg_rating REAL,
+            avg_difficulty REAL,
+            num_ratings INTEGER,
+            would_take_again REAL,
+            updated_at TIMESTAMP,
+            grade_distribution JSONB,
+            rating_distribution JSONB,
+            difficulty_distribution JSONB,
+            courses JSONB,
+            title TEXT,
+            source TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cec_evaluations (
+            professor_id INTEGER,
+            url TEXT PRIMARY KEY,
+            course_name TEXT,
+            course_code TEXT,
+            section TEXT,
+            instructor_name TEXT,
+            title TEXT,
+            quarter TEXT,
+            year INTEGER,
+            form_type TEXT,
+            surveyed INTEGER,
+            enrolled INTEGER,
+            questions JSONB
+        )
+    """)
+    conn.commit()
+    cur.close()
+
+
 def main():
     conn = psycopg2.connect(DB_URL, sslmode="require")
     conn.autocommit = False
+
+    init_db(conn)
+
+    # Full rebuild: truncate processed tables before repopulating from raw data
+    plain_cur = conn.cursor()
+    plain_cur.execute("TRUNCATE professors, cec_evaluations RESTART IDENTITY CASCADE")
+    conn.commit()
+    plain_cur.close()
 
     print("Reading raw data...")
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -72,44 +126,86 @@ def main():
     print(f"  RMP: {rmp_prof_count:,} professors, {rmp_rating_count:,} ratings")
     print(f"  CEC: {cec_count:,} evaluations")
 
-    # ── Step 1: Deduplicate RMP professors (same school + same name) ──
+    # ── Step 1: Find duplicate groups in memory (raw tables untouched) ──
     print("\nDeduplicating RMP professors...")
+
+    # Load school id → name mapping
+    cur.execute("SELECT rmp_id, name FROM schools WHERE rmp_id IS NOT NULL")
+    school_names = {r["rmp_id"]: r["name"] for r in cur.fetchall()}
+
+    # Group by name only (across all schools) to catch cross-campus duplicates
     cur.execute("""
-        SELECT school_id, LOWER(first_name || ' ' || last_name) as full_name,
-               array_agg(id ORDER BY num_ratings DESC) as ids
+        SELECT LOWER(first_name || ' ' || last_name) as full_name,
+               array_agg(id ORDER BY num_ratings DESC) as ids,
+               array_agg(school_id ORDER BY num_ratings DESC) as school_ids,
+               array_agg(department ORDER BY num_ratings DESC) as departments,
+               array_agg(avg_rating ORDER BY num_ratings DESC) as avg_ratings,
+               array_agg(avg_difficulty ORDER BY num_ratings DESC) as avg_diffs,
+               array_agg(would_take_again ORDER BY num_ratings DESC) as wtas,
+               array_agg(num_ratings ORDER BY num_ratings DESC) as num_ratings_list
         FROM rmp_professors_raw
-        GROUP BY school_id, LOWER(first_name || ' ' || last_name)
+        GROUP BY LOWER(first_name || ' ' || last_name)
         HAVING COUNT(*) > 1
     """)
     dup_groups = cur.fetchall()
 
-    merged = 0
+    def weighted(values, weights):
+        pairs = [(v, w) for v, w in zip(values, weights) if v is not None and w]
+        if not pairs:
+            return None
+        return round(sum(v * w for v, w in pairs) / sum(w for _, w in pairs), 2)
+
+    def combined_school_name(school_ids):
+        names = sorted(set(school_names.get(sid, sid) for sid in school_ids if sid))
+        if len(names) == 3:
+            return "All campuses"
+        return " and ".join(names)
+
+    winner_to_all_ids = {}
+    winner_overrides = {}
+    loser_ids_set = set()
+    plain_cur = conn.cursor()
+
     for group in dup_groups:
         ids = group["ids"]
         winner_id = ids[0]
-        loser_ids = ids[1:]
-        # Re-point all ratings from losers to winner
-        plain_cur = conn.cursor()
+        winner_to_all_ids[winner_id] = ids
+        loser_ids_set.update(ids[1:])
+
+        total_n = sum(n for n in group["num_ratings_list"] if n)
+        school = combined_school_name(group["school_ids"])
+
+        # Ensure combined school exists in schools_new
         plain_cur.execute(
-            "UPDATE rmp_ratings_raw SET professor_id = %s WHERE professor_id = ANY(%s)",
-            (winner_id, loser_ids)
+            "INSERT INTO schools (rmp_id, name) VALUES (NULL, %s) ON CONFLICT (name) DO NOTHING",
+            (school,)
         )
-        plain_cur.execute(
-            "DELETE FROM rmp_professors_raw WHERE id = ANY(%s)",
-            (loser_ids,)
-        )
-        plain_cur.close()
-        merged += len(loser_ids)
+
+        unique_depts = list(dict.fromkeys(d for d in group["departments"] if d))
+        winner_overrides[winner_id] = {
+            "avg_rating":     weighted(group["avg_ratings"], group["num_ratings_list"]),
+            "avg_difficulty":  weighted(group["avg_diffs"], group["num_ratings_list"]),
+            "would_take_again": weighted(group["wtas"], group["num_ratings_list"]),
+            "num_ratings":    total_n,
+            "school":         school,
+            "departments":    json.dumps(unique_depts),
+        }
 
     conn.commit()
-    print(f"  Merged {merged} duplicate professors")
+    plain_cur.close()
 
-    # ── Step 2: Build professors_new from RMP ──
+    same_school = sum(1 for g in dup_groups if len(set(g["school_ids"])) == 1)
+    cross_campus = len(dup_groups) - same_school
+    print(f"  Same-school duplicates: {same_school} groups")
+    print(f"  Cross-campus duplicates: {cross_campus} groups")
+    print(f"  Total extra profiles removed: {len(loser_ids_set)}")
+
+    # ── Step 2: Build professors from RMP ──
     print("\nBuilding master professors table from RMP...")
     cur.execute("SELECT * FROM rmp_professors_raw")
-    rmp_profs = cur.fetchall()
+    rmp_profs = [p for p in cur.fetchall() if p["id"] not in loser_ids_set]
 
-    # Compute derived stats per professor
+    # Build ratings lookup — include all IDs in each group
     cur.execute("SELECT professor_id, helpful_rating, difficulty_rating, grade, class FROM rmp_ratings_raw")
     all_ratings = cur.fetchall()
     ratings_by_prof = {}
@@ -119,14 +215,25 @@ def main():
             ratings_by_prof[pid] = []
         ratings_by_prof[pid].append(r)
 
+    def get_all_ratings(prof_id):
+        all_ids = winner_to_all_ids.get(prof_id, [prof_id])
+        return [r for pid in all_ids for r in ratings_by_prof.get(pid, [])]
+
+    def get_school(prof):
+        if prof["id"] in winner_overrides:
+            return winner_overrides[prof["id"]]["school"]
+        return school_names.get(prof["school_id"])
+
     plain_cur = conn.cursor()
     psycopg2.extras.execute_values(plain_cur, """
-        INSERT INTO professors_new
-        (rmp_id, school_id, first_name, last_name, department, avg_rating, avg_difficulty,
+        INSERT INTO professors
+        (rmp_id, school, first_name, last_name, departments, avg_rating, avg_difficulty,
          num_ratings, would_take_again, updated_at, grade_distribution, rating_distribution,
          difficulty_distribution, courses, source)
         VALUES %s
         ON CONFLICT (rmp_id) DO UPDATE SET
+            school = EXCLUDED.school,
+            departments = EXCLUDED.departments,
             avg_rating = EXCLUDED.avg_rating,
             avg_difficulty = EXCLUDED.avg_difficulty,
             num_ratings = EXCLUDED.num_ratings,
@@ -137,9 +244,13 @@ def main():
             difficulty_distribution = EXCLUDED.difficulty_distribution,
             courses = EXCLUDED.courses
     """, [(
-        p["id"], p["school_id"], p["first_name"], p["last_name"], p["department"],
-        p["avg_rating"], p["avg_difficulty"], p["num_ratings"], p["would_take_again"],
-        p["updated_at"], *compute_derived(ratings_by_prof.get(p["id"], [])), "rmp"
+        p["id"], get_school(p), p["first_name"], p["last_name"],
+        winner_overrides.get(p["id"], {}).get("departments", json.dumps([p["department"]] if p["department"] else [])),
+        winner_overrides.get(p["id"], {}).get("avg_rating", p["avg_rating"]),
+        winner_overrides.get(p["id"], {}).get("avg_difficulty", p["avg_difficulty"]),
+        winner_overrides.get(p["id"], {}).get("num_ratings", p["num_ratings"]),
+        winner_overrides.get(p["id"], {}).get("would_take_again", p["would_take_again"]),
+        p["updated_at"], *compute_derived(get_all_ratings(p["id"])), "rmp"
     ) for p in rmp_profs])
     conn.commit()
     plain_cur.close()
@@ -151,7 +262,7 @@ def main():
     cec_names = [r["instructor_name"] for r in cur.fetchall()]
 
     # Build lookup: normalized RMP name → professor serial id
-    cur.execute("SELECT id, rmp_id, LOWER(first_name || ' ' || last_name) as full_name FROM professors_new WHERE rmp_id IS NOT NULL")
+    cur.execute("SELECT id, rmp_id, LOWER(first_name || ' ' || last_name) as full_name FROM professors WHERE rmp_id IS NOT NULL")
     rmp_lookup = {}
     for r in cur.fetchall():
         name = r["full_name"]
@@ -174,7 +285,7 @@ def main():
             cec_name_to_prof_id[name] = matches[0]
             # Set cec_id on the matched professor
             plain_cur.execute(
-                "UPDATE professors_new SET cec_id = %s, source = 'both' WHERE id = %s",
+                "UPDATE professors SET cec_id = %s, source = 'both' WHERE id = %s",
                 (name, matches[0])
             )
             exact_matches += 1
@@ -183,7 +294,7 @@ def main():
         # Fuzzy match
         plain_cur.execute("""
             SELECT id, similarity(LOWER(first_name || ' ' || last_name), LOWER(%s)) AS sim
-            FROM professors_new
+            FROM professors
             WHERE rmp_id IS NOT NULL
               AND similarity(LOWER(first_name || ' ' || last_name), LOWER(%s)) > 0.7
             ORDER BY sim DESC
@@ -194,7 +305,7 @@ def main():
             prof_id = fuzzy[0][0]
             cec_name_to_prof_id[name] = prof_id
             plain_cur.execute(
-                "UPDATE professors_new SET cec_id = %s, source = 'both' WHERE id = %s",
+                "UPDATE professors SET cec_id = %s, source = 'both' WHERE id = %s",
                 (name, prof_id)
             )
             fuzzy_matches += 1
@@ -205,10 +316,9 @@ def main():
         first = parts[0] if parts else name
         last = parts[-1] if len(parts) > 1 else None
         plain_cur.execute("""
-            INSERT INTO professors_new (rmp_id, cec_id, first_name, last_name, school_id,
+            INSERT INTO professors (rmp_id, cec_id, first_name, last_name, school,
                 avg_rating, avg_difficulty, num_ratings, source)
             VALUES (NULL, %s, %s, %s, NULL, NULL, NULL, 0, 'cec')
-            ON CONFLICT DO NOTHING
             RETURNING id
         """, (name, first, last))
         row = plain_cur.fetchone()
@@ -273,7 +383,7 @@ def main():
     plain_cur = conn.cursor()
     for prof_id, (_, title) in best.items():
         plain_cur.execute(
-            "UPDATE professors_new SET title = %s WHERE id = %s",
+            "UPDATE professors SET title = %s WHERE id = %s",
             (title, prof_id)
         )
     conn.commit()
@@ -281,9 +391,9 @@ def main():
     print(f"  Updated titles for {len(best):,} professors")
 
     # ── Summary ──
-    cur.execute("SELECT COUNT(*) FROM professors_new")
+    cur.execute("SELECT COUNT(*) FROM professors")
     total = cur.fetchone()["count"]
-    cur.execute("SELECT source, COUNT(*) FROM professors_new GROUP BY source ORDER BY source")
+    cur.execute("SELECT source, COUNT(*) FROM professors GROUP BY source ORDER BY source")
     by_source = cur.fetchall()
     cur.execute("SELECT COUNT(*) FROM cec_evaluations WHERE professor_id IS NOT NULL")
     linked = cur.fetchone()["count"]
