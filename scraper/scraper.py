@@ -4,6 +4,9 @@ import psycopg2.extras
 import time
 import os
 import json
+import sys
+
+FORCE = "--force" in sys.argv
 
 GRAPHQL_URL = "https://www.ratemyprofessors.com/graphql"
 HEADERS = {
@@ -213,10 +216,13 @@ try:
         cur.close()
 
         new_prof_ids = {p["id"] for p in professors if p["id"] not in existing}
-        changed_prof_ids = {
-            p["id"] for p in professors
-            if p["numRatings"] > 0 and existing.get(p["id"]) != p["numRatings"]
-        }
+        if FORCE:
+            changed_prof_ids = {p["id"] for p in professors if p["numRatings"] > 0}
+        else:
+            changed_prof_ids = {
+                p["id"] for p in professors
+                if p["numRatings"] > 0 and existing.get(p["id"]) != p["numRatings"]
+            }
         any_changes = new_prof_ids or changed_prof_ids
 
         if any_changes:
