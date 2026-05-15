@@ -17,7 +17,17 @@ def get_client_ip(request: Request) -> str:
     return get_remote_address(request)
 
 limiter = Limiter(key_func=get_client_ip)
-app = FastAPI()
+app = FastAPI(
+    title="RateMyHusky API",
+    description=(
+        "Professor ratings data for University of Washington campuses "
+        "(Seattle, Bothell, Tacoma), sourced from RateMyProfessors.\n\n"
+        "**Rate limits:** Search endpoints are limited to 30 requests/minute per IP. "
+        "All other endpoints are limited to 60 requests/minute per IP.\n\n"
+        "**Note:** `avg_rating` and `avg_difficulty` are `-1` for professors with no ratings."
+    ),
+    version="1.0.0",
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -64,8 +74,9 @@ VALID_SORT_COLS = {"avg_rating", "avg_difficulty", "num_ratings"}
 VALID_SORT_ORDERS = {"asc", "desc"}
 
 
-@app.get("/health")
+@app.get("/health", tags=["Meta"], summary="Health check")
 def health(request: Request):
+    """Returns API and database status with DB response latency."""
     start = time.monotonic()
     try:
         with db_cursor() as cur:
@@ -80,17 +91,22 @@ def health(request: Request):
     }
 
 
-@app.get("/schools")
+@app.get("/schools", tags=["Schools"], summary="List all schools")
 @limiter.limit("60/minute")
 def get_schools(request: Request):
+    """Returns all UW campuses. Use the returned `id` as `school_id` in other endpoints."""
     with db_cursor() as cur:
         cur.execute("SELECT * FROM schools ORDER BY name")
         return cur.fetchall()
 
 
-@app.get("/departments")
+@app.get("/departments", tags=["Schools"], summary="List departments")
 @limiter.limit("60/minute")
-def get_departments(request: Request, school_id: str = Query(None)):
+def get_departments(
+    request: Request,
+    school_id: str = Query(None, description="Filter departments by school ID"),
+):
+    """Returns a list of all unique department names, optionally scoped to a school."""
     with db_cursor() as cur:
         if school_id:
             cur.execute(
@@ -106,20 +122,25 @@ def get_departments(request: Request, school_id: str = Query(None)):
         return [r["department"] for r in cur.fetchall()]
 
 
-@app.get("/professors")
+@app.get("/professors", tags=["Professors"], summary="List and filter professors")
 @limiter.limit("60/minute")
 def get_professors(
     request: Request,
-    school_id: str = Query(None),
-    department: str = Query(None),
-    min_ratings: int = Query(0),
-    min_rating: float = Query(None),
-    max_difficulty: float = Query(None),
-    sort_by: str = Query("avg_rating"),
-    sort_order: str = Query("desc"),
-    limit: int = Query(50),
-    offset: int = Query(0),
+    school_id: str = Query(None, description="Filter by school ID"),
+    department: str = Query(None, description="Filter by department name (partial match)"),
+    min_ratings: int = Query(0, description="Minimum number of ratings"),
+    min_rating: float = Query(None, description="Minimum average rating (1-5)"),
+    max_difficulty: float = Query(None, description="Maximum average difficulty (1-5)"),
+    sort_by: str = Query("avg_rating", description="Sort field: avg_rating, avg_difficulty, num_ratings"),
+    sort_order: str = Query("desc", description="Sort direction: asc or desc"),
+    limit: int = Query(50, description="Number of results (max 200)"),
+    offset: int = Query(0, description="Pagination offset"),
 ):
+    """
+    Returns a paginated list of professors with optional filtering and sorting.
+
+    Professors with no ratings have `avg_rating` and `avg_difficulty` set to `-1`.
+    """
     if sort_by not in VALID_SORT_COLS:
         raise HTTPException(status_code=400, detail=f"sort_by must be one of {VALID_SORT_COLS}")
     if sort_order not in VALID_SORT_ORDERS:
@@ -157,14 +178,22 @@ def get_professors(
     return paginate(professors, total, limit, offset)
 
 
-@app.get("/professors/search")
+@app.get("/professors/search", tags=["Professors"], summary="Search professors by name")
 @limiter.limit("30/minute")
 def search_professors(
     request: Request,
-    name: str = Query(..., min_length=2),
-    school_id: str = Query(None),
-    limit: int = Query(10),
+    name: str = Query(..., min_length=2, description="Professor name (first last, last first, or with middle name)"),
+    school_id: str = Query(None, description="Scope search to a specific school"),
+    limit: int = Query(10, description="Number of results (max 50)"),
 ):
+    """
+    Searches professors by name. Handles:
+    - Case-insensitive matching
+    - Middle names and initials (e.g. \"Jason F. Lambacher\" → matches \"Jason Lambacher\")
+    - Reversed name order (e.g. \"Lambacher Jason\" → matches \"Jason Lambacher\")
+
+    Results are ordered by number of ratings descending.
+    """
     limit = min(limit, 50)
 
     parts = name.strip().split()
@@ -190,9 +219,10 @@ def search_professors(
         return cur.fetchall()
 
 
-@app.get("/professors/{professor_id}")
+@app.get("/professors/{professor_id}", tags=["Professors"], summary="Get a professor by ID")
 @limiter.limit("60/minute")
 def get_professor(request: Request, professor_id: str):
+    """Returns a single professor record by their RMP ID."""
     with db_cursor() as cur:
         cur.execute("SELECT * FROM professors WHERE id = %s", (professor_id,))
         professor = cur.fetchone()
@@ -201,14 +231,15 @@ def get_professor(request: Request, professor_id: str):
     return professor
 
 
-@app.get("/professors/{professor_id}/ratings")
+@app.get("/professors/{professor_id}/ratings", tags=["Professors"], summary="Get ratings for a professor")
 @limiter.limit("30/minute")
 def get_ratings(
     request: Request,
     professor_id: str,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200, description="Number of ratings (max 200)"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
 ):
+    """Returns paginated student ratings for a professor, ordered by date descending."""
     with db_cursor() as cur:
         cur.execute("SELECT id FROM professors WHERE id = %s", (professor_id,))
         if not cur.fetchone():
