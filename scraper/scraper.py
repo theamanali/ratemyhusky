@@ -282,11 +282,12 @@ for school in SCHOOLS:
             prof_id = batch_ids[int(key[1:])]
             for e in val["ratings"]["edges"]:
                 n = e["node"]
+                attendance = n["attendanceMandatory"]
                 ratings.append((
                     n["id"], prof_id, n["class"], n["date"], n["comment"],
                     n["clarityRating"], n["helpfulRating"], n["difficultyRating"],
                     n["grade"], n["wouldTakeAgain"], n["isForOnlineClass"],
-                    n["attendanceMandatory"],
+                    attendance == "mandatory" if attendance else None,
                 ))
 
         cur = conn.cursor()
