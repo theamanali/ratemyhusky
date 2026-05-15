@@ -11,17 +11,18 @@ BASE_URL = "https://www.washington.edu/cec"
 TOC_URL = f"{BASE_URL}/toc.html"
 LETTERS = list("abcdefghijklmnopqrstuvwxyz")
 CONCURRENT_PAGES = 50
-TEST_LIMIT = None
 DB_URL = os.environ["DATABASE_URL"]
 
 
 def get_existing_urls():
     conn = psycopg2.connect(DB_URL, sslmode="require")
-    cur = conn.cursor()
-    cur.execute("SELECT url FROM cec_evaluations_raw")
-    urls = {row[0] for row in cur.fetchall()}
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT url FROM cec_evaluations_raw")
+        urls = {row[0] for row in cur.fetchall()}
+        cur.close()
+    finally:
+        conn.close()
     return urls
 
 
@@ -29,27 +30,29 @@ def save_to_db(results):
     if not results:
         return
     conn = psycopg2.connect(DB_URL, sslmode="require")
-    cur = conn.cursor()
-    psycopg2.extras.execute_values(cur, """
-        INSERT INTO cec_evaluations_raw
-        (url, course_name, course_code, section, instructor_name, title, quarter, form_type, surveyed, enrolled, questions)
-        VALUES %s
-        ON CONFLICT (url) DO UPDATE SET
-            instructor_name = EXCLUDED.instructor_name,
-            title = EXCLUDED.title,
-            quarter = EXCLUDED.quarter,
-            form_type = EXCLUDED.form_type,
-            surveyed = EXCLUDED.surveyed,
-            enrolled = EXCLUDED.enrolled,
-            questions = EXCLUDED.questions
-    """, [(
-        r["url"], r["course_name"], r["course_code"], r["section"],
-        r["instructor_name"], r["title"], r["quarter"], r["form_type"],
-        r["surveyed"], r["enrolled"], json.dumps(r["questions"]),
-    ) for r in results])
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(cur, """
+            INSERT INTO cec_evaluations_raw
+            (url, course_name, course_code, section, instructor_name, title, quarter, form_type, surveyed, enrolled, questions)
+            VALUES %s
+            ON CONFLICT (url) DO UPDATE SET
+                instructor_name = EXCLUDED.instructor_name,
+                title = EXCLUDED.title,
+                quarter = EXCLUDED.quarter,
+                form_type = EXCLUDED.form_type,
+                surveyed = EXCLUDED.surveyed,
+                enrolled = EXCLUDED.enrolled,
+                questions = EXCLUDED.questions
+        """, [(
+            r["url"], r["course_name"], r["course_code"], r["section"],
+            r["instructor_name"], r["title"], r["quarter"], r["form_type"],
+            r["surveyed"], r["enrolled"], json.dumps(r["questions"]),
+        ) for r in results])
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
 
 def _pct(s):
@@ -198,14 +201,21 @@ async def main():
     print(f"\r{len(existing_urls):,} previously scraped evaluations loaded")
 
     async with async_playwright() as p:
+        # Visible browser for manual UW NetID login
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context()
         page = await context.new_page()
-
         await page.goto(TOC_URL)
         print("\nBrowser opened. Please log in with your UW NetID.")
         print("Press Enter once you can see the Table of Contents page...")
         await asyncio.get_event_loop().run_in_executor(None, input)
+
+        # Transfer session cookies to a headless browser
+        cookies = await context.cookies()
+        await browser.close()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        await context.add_cookies(cookies)
 
         # Scan phase
         print("\nScanning...", end="", flush=True)
@@ -234,8 +244,6 @@ async def main():
             for link in letter_links[letter]
             if link["href"] not in existing_urls
         ]
-        if TEST_LIMIT:
-            all_new_links = all_new_links[:TEST_LIMIT]
 
         await scrape_all(context, all_new_links, existing_urls)
         await browser.close()
