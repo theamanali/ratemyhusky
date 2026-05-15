@@ -232,95 +232,97 @@ for school in SCHOOLS:
         page += 1
         time.sleep(0.5)
 
-    # Check which professors have new ratings by comparing num_ratings with DB
-    prof_ids_with_ratings = [p["id"] for p in professors if p["numRatings"] > 0]
-    changed_prof_ids = set()
-    if prof_ids_with_ratings:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, num_ratings FROM professors WHERE id = ANY(%s)",
-            (prof_ids_with_ratings,)
-        )
-        existing = {row[0]: row[1] for row in cur.fetchall()}
-        cur.close()
-        for p in professors:
-            if p["numRatings"] > 0 and existing.get(p["id"]) != p["numRatings"]:
-                changed_prof_ids.add(p["id"])
-
+    # Compare fetched professors against DB to find new/changed ones
     cur = conn.cursor()
-    psycopg2.extras.execute_values(cur, """
-        INSERT INTO professors (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again)
-        VALUES %s
-        ON CONFLICT (id) DO UPDATE SET
-            avg_rating = EXCLUDED.avg_rating,
-            avg_difficulty = EXCLUDED.avg_difficulty,
-            num_ratings = EXCLUDED.num_ratings,
-            would_take_again = EXCLUDED.would_take_again,
-            updated_at = CURRENT_TIMESTAMP
-    """, [(
-        p["id"], school["id"], p["firstName"], p["lastName"],
-        p["department"], p["avgRating"], p["avgDifficulty"],
-        p["numRatings"], p["wouldTakeAgainPercent"],
-    ) for p in professors])
-    conn.commit()
+    cur.execute(
+        "SELECT id, num_ratings FROM professors WHERE id = ANY(%s)",
+        ([p["id"] for p in professors],)
+    )
+    existing = {row[0]: row[1] for row in cur.fetchall()}
     cur.close()
-    print(f"  Saved {len(professors)} professors ({len(changed_prof_ids)} with new ratings)")
 
-    # Step 2: fetch ratings only for professors with new ratings
-    print("Step 2: Fetching ratings...")
-    ids = [p["id"] for p in professors if p["id"] in changed_prof_ids]
-    total_ratings = 0
-    total_batches = (len(ids) + RATINGS_BATCH_SIZE - 1) // RATINGS_BATCH_SIZE
+    new_prof_ids = {p["id"] for p in professors if p["id"] not in existing}
+    changed_prof_ids = {
+        p["id"] for p in professors
+        if p["numRatings"] > 0 and existing.get(p["id"]) != p["numRatings"]
+    }
+    any_changes = new_prof_ids or changed_prof_ids
 
-    for i in range(0, len(ids), RATINGS_BATCH_SIZE):
-        batch_ids = ids[i:i + RATINGS_BATCH_SIZE]
-        batch_num = (i // RATINGS_BATCH_SIZE) + 1
-
-        start = time.time()
-        data = fetch_ratings_batch(batch_ids)
-
-        if not data:
-            print(f"  Batch {batch_num}/{total_batches}: SKIPPED after retries")
-            continue
-
-        ratings = []
-        for key, val in data.get("data", {}).items():
-            if not val or "ratings" not in val:
-                continue
-            prof_id = batch_ids[int(key[1:])]
-            for e in val["ratings"]["edges"]:
-                n = e["node"]
-                attendance = n["attendanceMandatory"]
-                ratings.append((
-                    n["id"], prof_id, n["class"], n["date"], n["comment"],
-                    n["clarityRating"], n["helpfulRating"], n["difficultyRating"],
-                    n["grade"], n["wouldTakeAgain"], n["isForOnlineClass"],
-                    attendance == "mandatory" if attendance else None,
-                ))
-
+    if any_changes:
         cur = conn.cursor()
         psycopg2.extras.execute_values(cur, """
-            INSERT INTO ratings
-            (id, professor_id, class, date, comment, clarity_rating, helpful_rating,
-             difficulty_rating, grade, would_take_again, is_online, attendance_mandatory)
+            INSERT INTO professors (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again)
             VALUES %s
-            ON CONFLICT (id) DO NOTHING
-        """, ratings)
+            ON CONFLICT (id) DO UPDATE SET
+                avg_rating = EXCLUDED.avg_rating,
+                avg_difficulty = EXCLUDED.avg_difficulty,
+                num_ratings = EXCLUDED.num_ratings,
+                would_take_again = EXCLUDED.would_take_again,
+                updated_at = CURRENT_TIMESTAMP
+        """, [(
+            p["id"], school["id"], p["firstName"], p["lastName"],
+            p["department"], p["avgRating"], p["avgDifficulty"],
+            p["numRatings"], p["wouldTakeAgainPercent"],
+        ) for p in professors])
         conn.commit()
         cur.close()
-        elapsed = time.time() - start
-        total_ratings += len(ratings)
-        print(f"  Batch {batch_num}/{total_batches}: {len(ratings)} ratings in {elapsed:.2f}s (total: {total_ratings})")
-        time.sleep(0.5)
-
-    print(f"  Done: {len(professors)} professors, {total_ratings} ratings")
-
-    # Step 3: compute derived columns for professors with new ratings only
-    print("Step 3: Computing derived professor columns...")
-    if not changed_prof_ids:
-        print("  No professors with new ratings, skipping.")
+        print(f"  Done: Saved {len(new_prof_ids)} new professors, Found {len(changed_prof_ids)} professors with new ratings")
     else:
-        # Fetch all ratings for changed professors in one query
+        print("  No new professors or ratings — skipping steps 2 and 3.")
+
+    if any_changes:
+        # Step 2: fetch ratings for professors with new ratings
+        print("Step 2: Fetching ratings...")
+        ids = [p["id"] for p in professors if p["id"] in changed_prof_ids]
+        total_ratings = 0
+        total_batches = (len(ids) + RATINGS_BATCH_SIZE - 1) // RATINGS_BATCH_SIZE
+
+        for i in range(0, len(ids), RATINGS_BATCH_SIZE):
+            batch_ids = ids[i:i + RATINGS_BATCH_SIZE]
+            batch_num = (i // RATINGS_BATCH_SIZE) + 1
+
+            start = time.time()
+            data = fetch_ratings_batch(batch_ids)
+
+            if not data:
+                print(f"  Batch {batch_num}/{total_batches}: SKIPPED after retries")
+                continue
+
+            ratings = []
+            for key, val in data.get("data", {}).items():
+                if not val or "ratings" not in val:
+                    continue
+                prof_id = batch_ids[int(key[1:])]
+                for e in val["ratings"]["edges"]:
+                    n = e["node"]
+                    attendance = n["attendanceMandatory"]
+                    ratings.append((
+                        n["id"], prof_id, n["class"], n["date"], n["comment"],
+                        n["clarityRating"], n["helpfulRating"], n["difficultyRating"],
+                        n["grade"], n["wouldTakeAgain"], n["isForOnlineClass"],
+                        attendance == "mandatory" if attendance else None,
+                    ))
+
+            cur = conn.cursor()
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO ratings
+                (id, professor_id, class, date, comment, clarity_rating, helpful_rating,
+                 difficulty_rating, grade, would_take_again, is_online, attendance_mandatory)
+                VALUES %s
+                ON CONFLICT (id) DO NOTHING
+            """, ratings)
+            inserted = cur.rowcount
+            conn.commit()
+            cur.close()
+            elapsed = time.time() - start
+            total_ratings += inserted
+            print(f"  Batch {batch_num}/{total_batches}: {inserted} new ratings in {elapsed:.2f}s (total: {total_ratings})")
+            time.sleep(0.5)
+
+        print(f"  Done: Inserted {total_ratings} new rating(s) across {len(changed_prof_ids)} professor(s)")
+
+        # Step 3: compute derived columns for changed professors
+        print("Step 3: Computing derived professor columns...")
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT professor_id, helpful_rating, difficulty_rating, grade,
@@ -330,7 +332,6 @@ for school in SCHOOLS:
         all_ratings = cur.fetchall()
         cur.close()
 
-        # Group ratings by professor_id in Python
         ratings_by_prof = {}
         for r in all_ratings:
             pid = r["professor_id"]
@@ -338,7 +339,6 @@ for school in SCHOOLS:
                 ratings_by_prof[pid] = []
             ratings_by_prof[pid].append(r)
 
-        # Compute derived stats and bulk update
         updates = []
         for prof_id in changed_prof_ids:
             derived = compute_professor_derived(ratings_by_prof.get(prof_id, []))
@@ -363,7 +363,7 @@ for school in SCHOOLS:
         conn.commit()
         cur.close()
 
-        print(f"  Derived columns updated for {len(changed_prof_ids)} professors")
+        print(f"  Done: Recomputed derived stats for {len(changed_prof_ids)} professor(s)")
 
 conn.close()
 print(f"\nAll schools complete!")
