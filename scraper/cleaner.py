@@ -134,7 +134,7 @@ def main():
 
     # Group by name only (across all schools) to catch cross-campus duplicates
     cur.execute("""
-        SELECT LOWER(first_name || ' ' || last_name) as full_name,
+        SELECT REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\s+', ' ', 'g') as full_name,
                array_agg(id ORDER BY num_ratings DESC) as ids,
                array_agg(school_id ORDER BY num_ratings DESC) as school_ids,
                array_agg(department ORDER BY num_ratings DESC) as departments,
@@ -143,7 +143,7 @@ def main():
                array_agg(would_take_again ORDER BY num_ratings DESC) as wtas,
                array_agg(num_ratings ORDER BY num_ratings DESC) as num_ratings_list
         FROM rmp_professors_raw
-        GROUP BY LOWER(first_name || ' ' || last_name)
+        GROUP BY REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\s+', ' ', 'g')
         HAVING COUNT(*) > 1
     """)
     dup_groups = cur.fetchall()
@@ -259,7 +259,7 @@ def main():
     cec_names = [r["instructor_name"] for r in cur.fetchall()]
 
     # Build lookup: normalized RMP name → professor serial id
-    cur.execute("SELECT id, rmp_id, LOWER(first_name || ' ' || last_name) as full_name FROM professors WHERE rmp_id IS NOT NULL")
+    cur.execute("SELECT id, rmp_id, REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g') as full_name FROM professors WHERE rmp_id IS NOT NULL")
     rmp_lookup = {}
     for r in cur.fetchall():
         name = r["full_name"]
@@ -274,7 +274,7 @@ def main():
 
     plain_cur = conn.cursor()
     for name in cec_names:
-        normalized = name.strip().lower()
+        normalized = ' '.join(name.strip().lower().split())
 
         # Exact match
         matches = rmp_lookup.get(normalized, [])
