@@ -148,11 +148,22 @@ def fmt_time(seconds):
     return f"{mins}m{secs:02d}s"
 
 
+def fmt_eta(seconds):
+    mins = seconds / 60
+    if mins < 1:
+        return "<1 min"
+    return f"~{round(mins)} min"
+
+
 def render_bar(completed, total, elapsed, width=40):
     pct = completed / total if total > 0 else 0
     filled = int(width * pct)
     bar = "█" * filled + "░" * (width - filled)
-    eta_str = f" ETA {fmt_time((elapsed / completed) * (total - completed))}" if 0 < completed < total else ""
+    if 0 < completed < total:
+        eta = (elapsed / completed) * (total - completed)
+        eta_str = f" ETA {fmt_eta(eta)}"
+    else:
+        eta_str = ""
     return f"[{bar}] {completed:,}/{total:,} ({pct:.0%}) {fmt_time(elapsed)}{eta_str}"
 
 
