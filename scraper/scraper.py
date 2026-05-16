@@ -183,13 +183,14 @@ def main():
             any_changes = new_prof_ids or changed_prof_ids
 
             if any_changes:
+                changed_ids = new_prof_ids | changed_prof_ids
                 all_professors.extend([(
                     p["id"], school["id"], p["firstName"], p["lastName"],
                     p["department"],
                     p["avgRating"] if p["numRatings"] > 0 else None,
                     p["avgDifficulty"] if p["numRatings"] > 0 else None,
                     p["numRatings"], p["wouldTakeAgainPercent"] if p["wouldTakeAgainPercent"] != -1 else None,
-                ) for p in professors])
+                ) for p in professors if p["id"] in changed_ids])
                 print(f"  Done: {len(new_prof_ids)} new professors, {len(changed_prof_ids)} with new ratings")
             else:
                 print("  No new professors or ratings — skipping step 2.")
