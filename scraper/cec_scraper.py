@@ -217,9 +217,9 @@ async def main():
         await page.goto(TOC_URL)
         print("\nBrowser opened. Please log in with your UW NetID...")
 
-        # Wait for the TOC page to load (user completes login + 2FA)
+        # Wait for letter TOC links to appear — only visible when authenticated
         try:
-            await page.wait_for_url(TOC_URL, timeout=300_000)
+            await page.wait_for_selector("a[href*='-toc.html']", timeout=300_000)
         except Exception:
             print("\nLogin timed out or failed. Closing browser.")
             await browser.close()
