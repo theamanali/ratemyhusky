@@ -145,6 +145,7 @@ def main():
 
         all_professors = []
         all_ratings = []
+        all_changed_prof_ids = []
 
         # Step 1: fetch professors for all schools
         print("Fetching professors...")
@@ -182,35 +183,26 @@ def main():
                 p["avgDifficulty"] if p["numRatings"] > 0 else None,
                 p["numRatings"], p["wouldTakeAgainPercent"] if p["wouldTakeAgainPercent"] != -1 else None,
             ) for p in professors if p["id"] in changed_ids])
+            all_changed_prof_ids.extend(changed_prof_ids)
 
-            school["_professors"] = professors
-            school["_changed_prof_ids"] = changed_prof_ids
-            school["_new_prof_ids"] = new_prof_ids
             print(f"  {school['name']}: {len(professors):,} professors ({page} pages) — {len(new_prof_ids)} new, {len(changed_prof_ids)} with new ratings")
 
-        # Step 2: fetch ratings for all schools
+        # Step 2: fetch ratings for all changed professors
         print("\nFetching ratings...")
-        for school in SCHOOLS:
-            professors = school["_professors"]
-            changed_prof_ids = school["_changed_prof_ids"]
-            ids = [p["id"] for p in professors if p["id"] in changed_prof_ids]
-
-            if not ids:
-                print(f"  {school['name']}: no new ratings")
-                continue
-
-            total_batches = (len(ids) + RATINGS_BATCH_SIZE - 1) // RATINGS_BATCH_SIZE
-            school_ratings = 0
-
-            for i in range(0, len(ids), RATINGS_BATCH_SIZE):
-                batch_ids = ids[i:i + RATINGS_BATCH_SIZE]
+        if not all_changed_prof_ids:
+            print("  No new ratings")
+        else:
+            total_batches = (len(all_changed_prof_ids) + RATINGS_BATCH_SIZE - 1) // RATINGS_BATCH_SIZE
+            for i in range(0, len(all_changed_prof_ids), RATINGS_BATCH_SIZE):
+                batch_ids = all_changed_prof_ids[i:i + RATINGS_BATCH_SIZE]
                 batch_num = (i // RATINGS_BATCH_SIZE) + 1
                 batch_response = fetch_ratings_batch(batch_ids)
 
                 if not batch_response:
-                    print(f"  {school['name']} batch {batch_num}/{total_batches}: SKIPPED after retries")
+                    print(f"  Batch {batch_num}/{total_batches}: SKIPPED after retries")
                     continue
 
+                batch_ratings = 0
                 for alias, teacher in batch_response.get("data", {}).items():
                     if not teacher or "ratings" not in teacher:
                         continue
@@ -225,11 +217,10 @@ def main():
                             node["clarityRating"], node["helpfulRating"], node["difficultyRating"],
                             node["grade"], node["wouldTakeAgain"], node["isForOnlineClass"],
                         ))
-                        school_ratings += 1
+                        batch_ratings += 1
 
+                print(f"  Batch {batch_num}/{total_batches}: {batch_ratings:,} ratings")
                 time.sleep(0.5)
-
-            print(f"  {school['name']}: {school_ratings:,} ratings ({total_batches} batch{'es' if total_batches != 1 else ''})")
 
         # Step 3: write to DB
         print("\nSaving to DB...")
