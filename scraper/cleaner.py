@@ -201,6 +201,7 @@ def main():
     print(f"  Same-school:  {same_school_total} profiles combined into {same_school} professors")
     print(f"  Cross-campus: {cross_campus_total} profiles combined into {cross_campus} professors")
     print(f"  Total: {len(loser_ids_set)} duplicates removed, {same_school + cross_campus} professors merged")
+    print(f"  RMP professors after dedup: {rmp_prof_count - len(loser_ids_set):,}")
 
     # ── Step 2: Build professors from RMP ──
     print("\nBuilding master professors table from RMP...")
