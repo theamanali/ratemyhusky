@@ -269,6 +269,7 @@ def main():
 
     exact_matches = 0
     fuzzy_matches = 0
+    late_merges = 0
     new_profs = 0
     cec_name_to_prof_id = {}
 
@@ -280,7 +281,6 @@ def main():
         matches = rmp_lookup.get(normalized, [])
         if len(matches) == 1:
             cec_name_to_prof_id[name] = matches[0]
-            # Set cec_id on the matched professor
             plain_cur.execute(
                 "UPDATE professors SET cec_id = %s, source = 'both' WHERE id = %s",
                 (name, matches[0])
@@ -290,14 +290,15 @@ def main():
 
         # Fuzzy match
         plain_cur.execute("""
-            SELECT id, similarity(LOWER(first_name || ' ' || last_name), LOWER(%s)) AS sim
+            SELECT id, similarity(REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'), LOWER(%s)) AS sim
             FROM professors
             WHERE rmp_id IS NOT NULL
-              AND similarity(LOWER(first_name || ' ' || last_name), LOWER(%s)) > 0.7
+              AND similarity(REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'), LOWER(%s)) > 0.7
             ORDER BY sim DESC
-            LIMIT 2
+            LIMIT 5
         """, (name, name))
         fuzzy = plain_cur.fetchall()
+
         if len(fuzzy) == 1:
             prof_id = fuzzy[0][0]
             cec_name_to_prof_id[name] = prof_id
@@ -307,6 +308,60 @@ def main():
             )
             fuzzy_matches += 1
             continue
+
+        if len(fuzzy) > 1:
+            winner_id = fuzzy[0][0]
+            loser_ids = [f[0] for f in fuzzy[1:]]
+
+            # Check similarity between winner and each loser — if similar, they're the same person
+            similar_loser_ids = []
+            for loser_id in loser_ids:
+                plain_cur.execute("""
+                    SELECT similarity(
+                        REGEXP_REPLACE(LOWER(TRIM(p1.first_name || ' ' || p1.last_name)), '\\s+', ' ', 'g'),
+                        REGEXP_REPLACE(LOWER(TRIM(p2.first_name || ' ' || p2.last_name)), '\\s+', ' ', 'g')
+                    )
+                    FROM professors p1, professors p2
+                    WHERE p1.id = %s AND p2.id = %s
+                """, (winner_id, loser_id))
+                if plain_cur.fetchone()[0] > 0.7:
+                    similar_loser_ids.append(loser_id)
+
+            if similar_loser_ids:
+                all_ids = [winner_id] + similar_loser_ids
+                plain_cur.execute(
+                    "SELECT rmp_id, avg_rating, avg_difficulty, would_take_again, num_ratings FROM professors WHERE id = ANY(%s)",
+                    (all_ids,)
+                )
+                prof_rows = plain_cur.fetchall()
+
+                combined_ratings = [
+                    r for row in prof_rows if row[0]
+                    for r in ratings_by_prof.get(row[0], [])
+                ]
+                grade_dist, rating_dist, diff_dist, courses_json = compute_derived(combined_ratings)
+                num_ratings_list = [row[4] for row in prof_rows]
+                total_n = sum(n for n in num_ratings_list if n)
+
+                plain_cur.execute("""
+                    UPDATE professors SET
+                        avg_rating = %s, avg_difficulty = %s, num_ratings = %s,
+                        would_take_again = %s, grade_distribution = %s,
+                        rating_distribution = %s, difficulty_distribution = %s,
+                        courses = %s, cec_id = %s, source = 'both'
+                    WHERE id = %s
+                """, (
+                    weighted([row[1] for row in prof_rows], num_ratings_list),
+                    weighted([row[2] for row in prof_rows], num_ratings_list),
+                    total_n,
+                    weighted([row[3] for row in prof_rows], num_ratings_list),
+                    grade_dist, rating_dist, diff_dist, courses_json,
+                    name, winner_id,
+                ))
+                plain_cur.execute("DELETE FROM professors WHERE id = ANY(%s)", (similar_loser_ids,))
+                cec_name_to_prof_id[name] = winner_id
+                late_merges += 1
+                continue
 
         # No match — create new CEC-only professor
         parts = name.strip().split()
@@ -326,6 +381,7 @@ def main():
     plain_cur.close()
     print(f"  Exact matches:  {exact_matches:,}")
     print(f"  Fuzzy matches:  {fuzzy_matches:,}")
+    print(f"  Late merges:    {late_merges:,}")
     print(f"  New professors: {new_profs:,}")
 
     # ── Step 4: Populate cec_evaluations ──
