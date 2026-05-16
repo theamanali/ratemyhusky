@@ -359,6 +359,11 @@ def main():
                     name, winner_id,
                 ))
                 plain_cur.execute("DELETE FROM professors WHERE id = ANY(%s)", (similar_loser_ids,))
+                loser_set = set(similar_loser_ids)
+                cec_name_to_prof_id = {
+                    k: winner_id if v in loser_set else v
+                    for k, v in cec_name_to_prof_id.items()
+                }
                 cec_name_to_prof_id[name] = winner_id
                 late_merges += 1
                 continue
