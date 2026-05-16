@@ -128,20 +128,28 @@ def main():
     init_db(conn)
 
     try:
+        # Insert all schools upfront
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(cur,
+            "INSERT INTO schools (rmp_id, name) VALUES %s ON CONFLICT (rmp_id) DO NOTHING",
+            [(s["id"], s["name"]) for s in SCHOOLS]
+        )
+        conn.commit()
+        cur.close()
+
+        # Load all existing professors once
+        cur = conn.cursor()
+        cur.execute("SELECT id, num_ratings FROM rmp_professors_raw")
+        existing = {row[0]: row[1] for row in cur.fetchall()}
+        cur.close()
+
+        all_professors = []
         all_ratings = []
 
         for school in SCHOOLS:
             print(f"\n{'='*50}")
             print(f"School: {school['name']}")
             print(f"{'='*50}")
-
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO schools (rmp_id, name) VALUES (%s, %s)
-                ON CONFLICT (rmp_id) DO NOTHING
-            """, (school["id"], school["name"]))
-            conn.commit()
-            cur.close()
 
             # Step 1: fetch all professors
             print("Step 1: Fetching professor info...")
@@ -164,15 +172,6 @@ def main():
                 page += 1
                 time.sleep(0.5)
 
-            # Compare fetched professors against DB to find new/changed ones
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, num_ratings FROM rmp_professors_raw WHERE id = ANY(%s)",
-                ([p["id"] for p in professors],)
-            )
-            existing = {row[0]: row[1] for row in cur.fetchall()}
-            cur.close()
-
             new_prof_ids = {p["id"] for p in professors if p["id"] not in existing}
             if FORCE:
                 changed_prof_ids = {p["id"] for p in professors if p["numRatings"] > 0}
@@ -184,26 +183,14 @@ def main():
             any_changes = new_prof_ids or changed_prof_ids
 
             if any_changes:
-                cur = conn.cursor()
-                psycopg2.extras.execute_values(cur, """
-                    INSERT INTO rmp_professors_raw (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again)
-                    VALUES %s
-                    ON CONFLICT (id) DO UPDATE SET
-                        avg_rating = EXCLUDED.avg_rating,
-                        avg_difficulty = EXCLUDED.avg_difficulty,
-                        num_ratings = EXCLUDED.num_ratings,
-                        would_take_again = EXCLUDED.would_take_again,
-                        updated_at = CURRENT_TIMESTAMP
-                """, [(
+                all_professors.extend([(
                     p["id"], school["id"], p["firstName"], p["lastName"],
                     p["department"],
                     p["avgRating"] if p["numRatings"] > 0 else None,
                     p["avgDifficulty"] if p["numRatings"] > 0 else None,
                     p["numRatings"], p["wouldTakeAgainPercent"] if p["wouldTakeAgainPercent"] != -1 else None,
                 ) for p in professors])
-                conn.commit()
-                cur.close()
-                print(f"  Done: Saved {len(new_prof_ids)} new professors, Found {len(changed_prof_ids)} professors with new ratings")
+                print(f"  Done: {len(new_prof_ids)} new professors, {len(changed_prof_ids)} with new ratings")
             else:
                 print("  No new professors or ratings — skipping step 2.")
 
@@ -250,6 +237,22 @@ def main():
 
                 print(f"  Done: Processed {total_ratings} rating(s) across {len(changed_prof_ids)} professor(s)")
 
+        if all_professors:
+            cur = conn.cursor()
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO rmp_professors_raw (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again)
+                VALUES %s
+                ON CONFLICT (id) DO UPDATE SET
+                    avg_rating = EXCLUDED.avg_rating,
+                    avg_difficulty = EXCLUDED.avg_difficulty,
+                    num_ratings = EXCLUDED.num_ratings,
+                    would_take_again = EXCLUDED.would_take_again,
+                    updated_at = CURRENT_TIMESTAMP
+            """, all_professors)
+            conn.commit()
+            cur.close()
+            print(f"\nSaved {len(all_professors):,} professors to DB")
+
         if all_ratings:
             cur = conn.cursor()
             psycopg2.extras.execute_values(cur, """
@@ -261,7 +264,7 @@ def main():
             """, all_ratings)
             conn.commit()
             cur.close()
-            print(f"\nInserted {len(all_ratings):,} ratings into DB")
+            print(f"Saved {len(all_ratings):,} ratings to DB")
 
     finally:
         conn.close()
