@@ -99,6 +99,14 @@ def init_db(conn):
             questions JSONB
         )
     """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_professors_name_trgm
+        ON professors
+        USING GIST (
+            (REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'))
+            gist_trgm_ops
+        )
+    """)
     conn.commit()
     cur.close()
 
@@ -279,46 +287,75 @@ def main():
     cec_name_to_prof_id = {}
 
     plain_cur = conn.cursor()
+
+    # Phase 1: exact matches via Python dict lookup — batch UPDATE
+    unmatched_names = []
+    exact_update_rows = []
     for name in cec_names:
         normalized = ' '.join(name.strip().lower().split())
-
-        # Exact match
         matches = rmp_lookup.get(normalized, [])
         if len(matches) == 1:
             cec_name_to_prof_id[name] = matches[0]
-            plain_cur.execute(
-                "UPDATE professors SET cec_id = %s, source = 'both' WHERE id = %s",
-                (name, matches[0])
-            )
+            exact_update_rows.append((name, matches[0]))
             exact_matches += 1
-            continue
+        else:
+            unmatched_names.append(name)
 
-        # Fuzzy match
+    if exact_update_rows:
+        psycopg2.extras.execute_values(plain_cur, """
+            UPDATE professors SET cec_id = data.cec_name, source = 'both'
+            FROM (VALUES %s) AS data(cec_name, prof_id)
+            WHERE professors.id = data.prof_id::integer
+        """, exact_update_rows)
+
+    # Phase 2: single LATERAL fuzzy query for all unmatched names
+    fuzzy_by_name = {}
+    if unmatched_names:
         plain_cur.execute("""
-            SELECT id, similarity(REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'), LOWER(%s)) AS sim
-            FROM professors
-            WHERE rmp_id IS NOT NULL
-              AND similarity(REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'), LOWER(%s)) > 0.7
-            ORDER BY sim DESC
-            LIMIT 5
-        """, (name, name))
-        fuzzy = plain_cur.fetchall()
+            WITH cec AS (SELECT unnest(%s::text[]) AS name)
+            SELECT c.name AS cec_name, p.id AS prof_id,
+                   similarity(
+                       REGEXP_REPLACE(LOWER(TRIM(p.first_name || ' ' || p.last_name)), '\\s+', ' ', 'g'),
+                       LOWER(c.name)
+                   ) AS sim
+            FROM cec c
+            CROSS JOIN LATERAL (
+                SELECT id, first_name, last_name
+                FROM professors
+                WHERE rmp_id IS NOT NULL
+                  AND similarity(
+                      REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'),
+                      LOWER(c.name)
+                  ) > 0.7
+                ORDER BY similarity(
+                    REGEXP_REPLACE(LOWER(TRIM(first_name || ' ' || last_name)), '\\s+', ' ', 'g'),
+                    LOWER(c.name)
+                ) DESC
+                LIMIT 5
+            ) p
+            ORDER BY cec_name, sim DESC
+        """, (unmatched_names,))
+        for row in plain_cur.fetchall():
+            fuzzy_by_name.setdefault(row[0], []).append((row[1], row[2]))
 
-        if len(fuzzy) == 1:
-            prof_id = fuzzy[0][0]
+    # Phase 3: process fuzzy results — collect batches for writes
+    fuzzy_update_rows = []
+    new_prof_rows = []
+
+    for name in unmatched_names:
+        candidates = fuzzy_by_name.get(name, [])
+
+        if len(candidates) == 1:
+            prof_id = candidates[0][0]
             cec_name_to_prof_id[name] = prof_id
-            plain_cur.execute(
-                "UPDATE professors SET cec_id = %s, source = 'both' WHERE id = %s",
-                (name, prof_id)
-            )
+            fuzzy_update_rows.append((name, prof_id))
             fuzzy_matches += 1
-            continue
 
-        if len(fuzzy) > 1:
-            winner_id = fuzzy[0][0]
-            loser_ids = [f[0] for f in fuzzy[1:]]
+        elif len(candidates) > 1:
+            winner_id = candidates[0][0]
+            loser_ids = [c[0] for c in candidates[1:]]
 
-            # Check similarity between winner and each loser — if similar, they're the same person
+            # Check inter-match similarity — similar losers are the same person
             similar_loser_ids = []
             for loser_id in loser_ids:
                 plain_cur.execute("""
@@ -339,7 +376,6 @@ def main():
                     (all_ids,)
                 )
                 prof_rows = plain_cur.fetchall()
-
                 combined_ratings = [
                     r for row in prof_rows if row[0]
                     for r in ratings_by_prof.get(row[0], [])
@@ -347,7 +383,6 @@ def main():
                 grade_dist, rating_dist, diff_dist, courses_json = compute_derived(combined_ratings)
                 num_ratings_list = [row[4] for row in prof_rows]
                 total_n = sum(n for n in num_ratings_list if n)
-
                 plain_cur.execute("""
                     UPDATE professors SET
                         avg_rating = %s, avg_difficulty = %s, num_ratings = %s,
@@ -373,19 +408,32 @@ def main():
                 late_merges += 1
                 continue
 
-        # No match — create new CEC-only professor
-        parts = name.strip().split()
-        first = parts[0] if parts else name
-        last = parts[-1] if len(parts) > 1 else None
-        plain_cur.execute("""
+            # Ambiguous — no confident match, fall through to new professor
+            parts = name.strip().split()
+            new_prof_rows.append((name, parts[0] if parts else name, parts[-1] if len(parts) > 1 else None))
+
+        else:
+            # No match at all
+            parts = name.strip().split()
+            new_prof_rows.append((name, parts[0] if parts else name, parts[-1] if len(parts) > 1 else None))
+
+    # Phase 4: batched writes
+    if fuzzy_update_rows:
+        psycopg2.extras.execute_values(plain_cur, """
+            UPDATE professors SET cec_id = data.cec_name, source = 'both'
+            FROM (VALUES %s) AS data(cec_name, prof_id)
+            WHERE professors.id = data.prof_id::integer
+        """, fuzzy_update_rows)
+
+    if new_prof_rows:
+        returned = psycopg2.extras.execute_values(plain_cur, """
             INSERT INTO professors (rmp_id, cec_id, first_name, last_name, school,
                 avg_rating, avg_difficulty, num_ratings, source)
-            VALUES (NULL, %s, %s, %s, NULL, NULL, NULL, 0, 'cec')
-            RETURNING id
-        """, (name, first, last))
-        row = plain_cur.fetchone()
-        if row:
-            cec_name_to_prof_id[name] = row[0]
+            VALUES %s
+            RETURNING id, cec_id
+        """, new_prof_rows, template="(NULL, %s, %s, %s, NULL, NULL, NULL, 0, 'cec')", fetch=True)
+        for row in returned:
+            cec_name_to_prof_id[row[1]] = row[0]
             new_profs += 1
 
     plain_cur.close()
