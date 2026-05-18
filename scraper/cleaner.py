@@ -1,3 +1,4 @@
+import base64
 import html
 import json
 import os
@@ -146,6 +147,14 @@ def weighted(values, weights):
     return round(sum(v * w for v, w in pairs) / sum(w for _, w in pairs), 2)
 
 
+def rmp_url(rmp_id):
+    if not rmp_id:
+        return None
+    decoded = base64.b64decode(rmp_id + '==').decode('utf-8')
+    legacy_id = decoded.split('-')[-1]
+    return f"https://www.ratemyprofessors.com/professor/{legacy_id}"
+
+
 def normalize_course(raw):
     if not raw:
         return None
@@ -205,31 +214,76 @@ def combined_school_name(school_ids, school_names):
     return "All campuses" if len(names) == 3 else " and ".join(names)
 
 
+RESPONSE_ORDER = ["very_poor", "poor", "fair", "good", "very_good", "excellent", "median"]
+
+MEDIAN_QUESTIONS = [
+    ("Instructor's contribution",  "instructor_contribution_median"),
+    ("Instructor's effectiveness", "instructor_effectiveness_median"),
+    ("The course as a whole",      "course_as_whole_median"),
+    ("The course content",         "course_content_median"),
+    ("Amount learned",             "amount_learned_median"),
+    ("Instuctor's interest",       "instructor_interest_median"),
+    ("Grading techniques",         "grading_techniques_median"),
+]
+
+
+def _get_median(questions, question_name):
+    if not questions or question_name not in questions:
+        return None
+    q = questions[question_name]
+    if isinstance(q, dict):
+        return q.get("median")
+    if isinstance(q, list):
+        for item in q:
+            if item.get("level") == "median":
+                return item.get("value")
+    return None
+
+def _format_questions(questions):
+    if not questions:
+        return None
+    if isinstance(questions, str):
+        questions = json.loads(questions)
+    return json.dumps({
+        q: [{"level": k, "value": r.get(k)} for k in RESPONSE_ORDER if k in r]
+        for q, r in questions.items()
+    })
+
+
 def init_db(conn):
     cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS professors (
             id SERIAL PRIMARY KEY,
-            rmp_id TEXT UNIQUE,
             first_name TEXT,
             middle_name TEXT,
             last_name TEXT,
+            title TEXT,
             school TEXT,
             departments JSONB,
-            avg_rating REAL,
-            avg_difficulty REAL,
-            num_ratings INTEGER,
-            would_take_again REAL,
-            updated_at TIMESTAMP,
+            rmp_rating_count INTEGER,
+            cec_eval_count INTEGER,
+            avg_instructor_contribution_median REAL,
+            avg_instructor_effectiveness_median REAL,
+            avg_course_as_whole_median REAL,
+            avg_course_content_median REAL,
+            avg_amount_learned_median REAL,
+            avg_instructor_interest_median REAL,
+            avg_grading_techniques_median REAL,
+            rating_tags_distribution JSONB,
+            avg_quality_rating REAL,
+            avg_difficulty_rating REAL,
+            would_take_again_percent REAL,
+            is_online_percent REAL,
+            attendance_is_mandatory_percent REAL,
             grade_distribution JSONB,
             rating_distribution JSONB,
             difficulty_distribution JSONB,
             rmp_courses JSONB,
-            is_online_percent REAL,
-            attendance_is_mandatory_percent REAL,
-            rating_tags_distribution JSONB,
-            title TEXT,
+            rmp_url TEXT,
+            cec_courses JSONB,
+            updated_at TIMESTAMP,
             source TEXT
         )
     """)
@@ -247,7 +301,14 @@ def init_db(conn):
             form_type TEXT,
             surveyed INTEGER,
             enrolled INTEGER,
-            questions JSONB
+            questions JSONB,
+            instructor_contribution_median REAL,
+            instructor_effectiveness_median REAL,
+            course_as_whole_median REAL,
+            course_content_median REAL,
+            amount_learned_median REAL,
+            instructor_interest_median REAL,
+            grading_techniques_median REAL
         )
     """)
     cur.execute("""
@@ -312,7 +373,7 @@ def main():
     for name, profs in name_to_profs.items():
         if len(profs) <= 1:
             continue
-        profs = sorted(profs, key=lambda p: p["num_ratings"] or 0, reverse=True)
+        profs = sorted(profs, key=lambda p: p["rmp_rating_count"] or 0, reverse=True)
         winner = profs[0]
 
         school_ids = [p["school_id"] for p in profs]
@@ -326,17 +387,17 @@ def main():
 
         winner_to_all_rmp_ids[winner["id"]] = [p["id"] for p in profs]
 
-        num_ratings_list = [p["num_ratings"] for p in profs]
+        rmp_rating_count_list = [p["rmp_rating_count"] for p in profs]
         school = combined_school_name(school_ids, school_names)
         new_school_names.add(school)
         unique_depts = list(dict.fromkeys(normalize_dept(p["department"]) for p in profs if p["department"]))
         unique_depts = [d for d in unique_depts if d]
 
         winner_overrides[winner["id"]] = {
-            "avg_rating":         weighted([p["avg_rating"] for p in profs], num_ratings_list),
-            "avg_difficulty":     weighted([p["avg_difficulty"] for p in profs], num_ratings_list),
-            "would_take_again":   weighted([p["would_take_again"] for p in profs], num_ratings_list),
-            "num_ratings":        sum(n for n in num_ratings_list if n),
+            "avg_quality_rating":         weighted([p["avg_quality_rating"] for p in profs], rmp_rating_count_list),
+            "avg_difficulty_rating":     weighted([p["avg_difficulty_rating"] for p in profs], rmp_rating_count_list),
+            "would_take_again_percent": weighted([p["would_take_again"] for p in profs], rmp_rating_count_list),
+            "rmp_rating_count":        sum(n for n in rmp_rating_count_list if n),
             "school":             school,
             "departments":        json.dumps(unique_depts),
         }
@@ -367,15 +428,19 @@ def main():
         _first, _middle, _last = parse_name(f"{p['first_name'] or ''} {p['last_name'] or ''}", capitalize=True)
         prof = {
             "rmp_id":                 p["id"],
+            "rmp_url":                rmp_url(p["id"]),
             "school":                 ov.get("school", school_names.get(p["school_id"])),
             "first_name":             _first,
             "middle_name":            _middle,
             "last_name":              _last,
             "departments":            ov.get("departments", json.dumps([normalize_dept(p["department"])] if normalize_dept(p["department"]) else [])),
-            "avg_rating":             ov.get("avg_rating", p["avg_rating"]),
-            "avg_difficulty":         ov.get("avg_difficulty", p["avg_difficulty"]),
-            "num_ratings":            ov.get("num_ratings", p["num_ratings"]),
-            "would_take_again":       ov.get("would_take_again", p["would_take_again"]),
+            "avg_quality_rating":             ov.get("avg_quality_rating", p["avg_quality_rating"]),
+            "avg_difficulty_rating":         ov.get("avg_difficulty_rating", p["avg_difficulty_rating"]),
+            "rmp_rating_count":            ov.get("rmp_rating_count", p["rmp_rating_count"]),
+            "cec_eval_count":             None,
+            **{f"avg_{col}": None for _, col in MEDIAN_QUESTIONS},
+            "would_take_again_percent": ov.get("would_take_again_percent", p["would_take_again"]),
+            "cec_courses":                None,
             "updated_at":             p["updated_at"],
             "grade_distribution":     grade_dist,
             "rating_distribution":    rating_dist,
@@ -453,12 +518,12 @@ def main():
                     combined_ratings.extend(ratings_by_prof.get(rmp_id, []))
 
                 grade_dist, rating_dist, diff_dist, is_online_pct, att_pct, tag_dist, rmp_courses = compute_derived(combined_ratings)
-                num_ratings_list = [p["num_ratings"] for p in all_profs]
+                rmp_rating_count_list = [p["rmp_rating_count"] for p in all_profs]
                 winner_prof.update({
-                    "avg_rating":             weighted([p["avg_rating"] for p in all_profs], num_ratings_list),
-                    "avg_difficulty":          weighted([p["avg_difficulty"] for p in all_profs], num_ratings_list),
-                    "would_take_again":        weighted([p["would_take_again"] for p in all_profs], num_ratings_list),
-                    "num_ratings":             sum(n for n in num_ratings_list if n),
+                    "avg_quality_rating":             weighted([p["avg_quality_rating"] for p in all_profs], rmp_rating_count_list),
+                    "avg_difficulty_rating":          weighted([p["avg_difficulty_rating"] for p in all_profs], rmp_rating_count_list),
+                    "would_take_again_percent": weighted([p["would_take_again_percent"] for p in all_profs], rmp_rating_count_list),
+                    "rmp_rating_count":             sum(n for n in rmp_rating_count_list if n),
                     "grade_distribution":      grade_dist,
                     "rating_distribution":     rating_dist,
                     "difficulty_distribution": diff_dist,
@@ -488,13 +553,17 @@ def main():
         _first, _middle, _last = parse_name(cec_name)
         prof = {
             "rmp_id": None,
+            "rmp_url": None,
             "school": None,
             "first_name": _first,
             "middle_name": _middle,
             "last_name": _last,
             "departments": None,
-            "avg_rating": None, "avg_difficulty": None,
-            "num_ratings": 0, "would_take_again": None,
+            "avg_quality_rating": None, "avg_difficulty_rating": None,
+            "rmp_rating_count": 0, "cec_eval_count": None,
+            **{f"avg_{col}": None for _, col in MEDIAN_QUESTIONS},
+            "would_take_again_percent": None,
+            "cec_courses": None,
             "updated_at": None,
             "grade_distribution": None, "rating_distribution": None,
             "difficulty_distribution": None, "rmp_courses": None,
@@ -516,6 +585,9 @@ def main():
     print("\nBuilding CEC evaluations and computing titles...")
 
     title_tracker = {}  # instructor_name -> (sort_key, title_text)
+    cec_eval_counts = defaultdict(int)      # instructor_name -> eval count
+    cec_course_data = defaultdict(lambda: defaultdict(set))   # instructor_name -> course_code -> {(quarter, year)}
+    cec_course_sections = defaultdict(lambda: defaultdict(int))  # instructor_name -> course_code -> section count
     cec_eval_instructors = []
     cec_eval_rows = []
     for e in cec_evals_raw:
@@ -527,18 +599,67 @@ def main():
             if key > title_tracker.get(instructor, (0, None))[0]:
                 title_tracker[instructor] = (key, e["title"])
 
+        if instructor:
+            cec_eval_counts[instructor] += 1
+            if e["course_code"] and quarter and year:
+                cec_course_data[instructor][e["course_code"]].add((quarter, year))
+                cec_course_sections[instructor][e["course_code"]] += 1
+
+        medians = [_get_median(e["questions"], q) for q, _ in MEDIAN_QUESTIONS]
         cec_eval_instructors.append(instructor)
         cec_eval_rows.append((
             e["url"], e["course_name"], e["course_code"], e["section"],
             instructor, e["title"], quarter, year, e["form_type"],
             e["surveyed"], e["enrolled"],
-            json.dumps(e["questions"]) if isinstance(e["questions"], dict) else e["questions"],
+            _format_questions(e["questions"]),
+            *medians,
         ))
 
     for instructor, (_, title) in title_tracker.items():
         prof = cec_name_to_prof.get(instructor)
         if prof is not None:
             prof["title"] = title
+
+    # Accumulate medians per instructor for professor-level averages
+    cec_median_accum = defaultdict(lambda: defaultdict(list))  # instructor -> col_name -> [values]
+    for row, instructor in zip(cec_eval_rows, cec_eval_instructors):
+        if not instructor:
+            continue
+        for i, (_, col) in enumerate(MEDIAN_QUESTIONS):
+            val = row[12 + i]  # medians start after the 12 fixed columns
+            if val is not None:
+                cec_median_accum[instructor][col].append(val)
+
+    # Aggregate cec_eval_count and cec_courses per professor
+    prof_cec_counts = defaultdict(int)
+    prof_cec_courses = defaultdict(lambda: defaultdict(set))
+    prof_cec_sections = defaultdict(lambda: defaultdict(int))
+    prof_median_accum = defaultdict(lambda: defaultdict(list))
+    for instructor, prof in cec_name_to_prof.items():
+        pid = id(prof)
+        prof_cec_counts[pid] += cec_eval_counts.get(instructor, 0)
+        for code, quarters in cec_course_data.get(instructor, {}).items():
+            prof_cec_courses[pid][code].update(quarters)
+            prof_cec_sections[pid][code] += cec_course_sections[instructor].get(code, 0)
+        for col, vals in cec_median_accum.get(instructor, {}).items():
+            prof_median_accum[pid][col].extend(vals)
+
+    for prof in professors:
+        pid = id(prof)
+        count = prof_cec_counts.get(pid)
+        prof["cec_eval_count"] = count if count else None
+        courses = prof_cec_courses.get(pid, {})
+        prof["cec_courses"] = json.dumps(sorted(
+            [{"code": code,
+              "quarters_count": len(quarters),
+              "total_sections_count": prof_cec_sections[pid].get(code, 0),
+              "quarters": sorted(f"{q} {y}" for q, y in quarters)}
+             for code, quarters in courses.items()],
+            key=lambda x: -x["quarters_count"]
+        )) if courses else None
+        for _, col in MEDIAN_QUESTIONS:
+            vals = prof_median_accum[pid].get(col, [])
+            prof[f"avg_{col}"] = round(sum(vals) / len(vals), 4) if vals else None
 
     print(f"  Built {len(cec_eval_rows):,} evaluations")
 
@@ -559,20 +680,27 @@ def main():
     # Insert professors
     returned = psycopg2.extras.execute_values(plain_cur, """
         INSERT INTO professors
-        (rmp_id, first_name, middle_name, last_name, school, departments, avg_rating, avg_difficulty,
-         num_ratings, would_take_again, updated_at, grade_distribution, rating_distribution,
-         difficulty_distribution, rmp_courses, is_online_percent, attendance_is_mandatory_percent,
-         rating_tags_distribution, title, source)
+        (first_name, middle_name, last_name, title, school, departments,
+         rmp_rating_count, cec_eval_count, avg_instructor_contribution_median, avg_instructor_effectiveness_median,
+         avg_course_as_whole_median, avg_course_content_median, avg_amount_learned_median,
+         avg_instructor_interest_median, avg_grading_techniques_median,
+         rating_tags_distribution, avg_quality_rating, avg_difficulty_rating, would_take_again_percent,
+         is_online_percent, attendance_is_mandatory_percent,
+         grade_distribution, rating_distribution, difficulty_distribution,
+         rmp_courses, rmp_url, cec_courses, updated_at, source)
         VALUES %s
         RETURNING id
     """, [(
-        p["rmp_id"], p["first_name"], p["middle_name"], p["last_name"], p["school"],
-        p["departments"], p["avg_rating"], p["avg_difficulty"],
-        p["num_ratings"], p["would_take_again"], p["updated_at"],
-        p["grade_distribution"], p["rating_distribution"],
-        p["difficulty_distribution"], p["rmp_courses"],
-        p["is_online_percent"], p["attendance_is_mandatory_percent"], p["rating_tags_distribution"],
-        p["title"], p["source"],
+        p["first_name"], p["middle_name"], p["last_name"], p["title"], p["school"],
+        p["departments"], p["rmp_rating_count"], p["cec_eval_count"],
+        p["avg_instructor_contribution_median"], p["avg_instructor_effectiveness_median"],
+        p["avg_course_as_whole_median"], p["avg_course_content_median"], p["avg_amount_learned_median"],
+        p["avg_instructor_interest_median"], p["avg_grading_techniques_median"],
+        p["rating_tags_distribution"],
+        p["avg_quality_rating"], p["avg_difficulty_rating"], p["would_take_again_percent"],
+        p["is_online_percent"], p["attendance_is_mandatory_percent"],
+        p["grade_distribution"], p["rating_distribution"], p["difficulty_distribution"],
+        p["rmp_courses"], p["rmp_url"], p["cec_courses"], p["updated_at"], p["source"],
     ) for p in professors], fetch=True)
 
     # Map each prof dict to its serial id by insertion order
@@ -596,7 +724,10 @@ def main():
     psycopg2.extras.execute_values(plain_cur, """
         INSERT INTO cec_evaluations
         (professor_id, url, course_name, course_code, section, instructor_name, title,
-         quarter, year, form_type, surveyed, enrolled, questions)
+         quarter, year, form_type, surveyed, enrolled, questions,
+         instructor_contribution_median, instructor_effectiveness_median,
+         course_as_whole_median, course_content_median, amount_learned_median,
+         instructor_interest_median, grading_techniques_median)
         VALUES %s
         ON CONFLICT (url) DO UPDATE SET
             professor_id = EXCLUDED.professor_id,

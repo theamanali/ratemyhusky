@@ -44,9 +44,9 @@ def init_db(db_conn):
             first_name TEXT,
             last_name TEXT,
             department TEXT,
-            avg_rating REAL,
-            avg_difficulty REAL,
-            num_ratings INTEGER,
+            avg_quality_rating REAL,
+            avg_difficulty_rating REAL,
+            rmp_rating_count INTEGER,
             would_take_again REAL,
             course_codes JSONB,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -147,7 +147,7 @@ def main():
 
         # Load all existing professors once
         cur = conn.cursor()
-        cur.execute("SELECT id, num_ratings FROM rmp_professors_raw")
+        cur.execute("SELECT id, rmp_rating_count FROM rmp_professors_raw")
         existing = {row[0]: row[1] for row in cur.fetchall()}
         cur.close()
 
@@ -239,12 +239,12 @@ def main():
         if all_professors:
             cur = conn.cursor()
             psycopg2.extras.execute_values(cur, """
-                INSERT INTO rmp_professors_raw (id, school_id, first_name, last_name, department, avg_rating, avg_difficulty, num_ratings, would_take_again, course_codes)
+                INSERT INTO rmp_professors_raw (id, school_id, first_name, last_name, department, avg_quality_rating, avg_difficulty_rating, rmp_rating_count, would_take_again, course_codes)
                 VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
-                    avg_rating = EXCLUDED.avg_rating,
-                    avg_difficulty = EXCLUDED.avg_difficulty,
-                    num_ratings = EXCLUDED.num_ratings,
+                    avg_quality_rating = EXCLUDED.avg_quality_rating,
+                    avg_difficulty_rating = EXCLUDED.avg_difficulty_rating,
+                    rmp_rating_count = EXCLUDED.rmp_rating_count,
                     would_take_again = EXCLUDED.would_take_again,
                     course_codes = EXCLUDED.course_codes,
                     updated_at = CURRENT_TIMESTAMP
