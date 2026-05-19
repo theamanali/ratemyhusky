@@ -24,10 +24,9 @@ def notify(message, title=None, priority="default", tags=None):
     if tags:
         headers["Tags"] = ",".join(tags)
     try:
-        r = requests.post(f"{url}/{topic}", data=message, headers=headers, timeout=5)
-        print(f"[ntfy] {r.status_code} — {url}/{topic}")
-    except Exception as e:
-        print(f"[ntfy] failed: {e}")
+        requests.post(f"{url}/{topic}", data=message, headers=headers, timeout=5)
+    except Exception:
+        pass
 
 
 def run_step(name, fn, *args, **kwargs):
