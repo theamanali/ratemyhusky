@@ -252,13 +252,8 @@ async def main():
         print("\nBrowser opened. Please log in with your UW NetID...")
         _notify("CEC scraper: browser open — please log in with your UW NetID", tags=["key"])
 
-        # Wait for letter TOC links to appear — only visible when authenticated
-        try:
-            await page.wait_for_selector("a[href*='-toc.html']", timeout=300_000)
-        except Exception:
-            print("\nLogin timed out or failed. Closing browser.")
-            await browser.close()
-            return
+        # Wait indefinitely for letter TOC links to appear — only visible when authenticated
+        await page.wait_for_selector("a[href*='-toc.html']", timeout=0)
         print("Authenticated! Switching to headless browser...")
 
         # Transfer session cookies to a headless browser
