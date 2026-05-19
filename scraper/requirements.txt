@@ -4,3 +4,4 @@ playwright
 nameparser
 python-dotenv
 rapidfuzz
+
