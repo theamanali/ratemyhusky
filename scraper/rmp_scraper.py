@@ -8,16 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 RMP_BASE_URL = "https://www.ratemyprofessors.com"
 GRAPHQL_URL = f"{RMP_BASE_URL}/graphql"
-HEADERS = {
-    "Authorization": "Basic dGVzdDp0ZXN0",
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": f"{RMP_BASE_URL}/",
-    "Origin": RMP_BASE_URL,
-}
+RMP_AUTH = os.environ.get("RMP_AUTH")
 SCHOOLS = [
     {"id": "U2Nob29sLTE1MzA=", "name": "UW Seattle"},
     {"id": "U2Nob29sLTQ0NjY=", "name": "UW Bothell"},
@@ -28,6 +21,13 @@ RATINGS_BATCH_SIZE = 1000
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 DB_URL = os.environ["DATABASE_URL"]
+HEADERS = {
+    "Authorization": RMP_AUTH,
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X 15_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/605.1.15",
+    "Referer": f"{RMP_BASE_URL}/",
+    "Origin": RMP_BASE_URL,
+}
 
 
 def init_db(db_conn):
