@@ -106,9 +106,6 @@ def health(request: Request):
 def match_professors(
     request: Request,
     name: str = Query(..., min_length=2),
-    school: str = Query(None),
-    department: str = Query(None),
-    limit: int = Query(10, le=50),
 ):
     first, middle, last = parse_name(name)
     if not first or not last:
@@ -116,13 +113,6 @@ def match_professors(
 
     base_filters = ["unaccent(lower(first_name)) = %s", "unaccent(lower(last_name)) = %s"]
     base_params = [norm(first), norm(last)]
-
-    if school:
-        base_filters.append("school = %s")
-        base_params.append(school)
-    if department:
-        base_filters.append("departments::text ILIKE %s")
-        base_params.append(f"%{department}%")
 
     def fetch(extra_filters=None, extra_params=None):
         filters = base_filters + (extra_filters or [])
@@ -137,7 +127,7 @@ def match_professors(
     if middle:
         results = fetch()
         if len(results) <= 1:
-            return results[:limit]
+            return results
         # disambiguate by middle name character by character
         query_middle = norm(middle)
         for char_count in range(1, len(query_middle) + 1):
@@ -147,11 +137,11 @@ def match_professors(
                 return filtered
             if filtered:
                 results = filtered
-        return results[:limit]
+        return results
     else:
         # prefer professors with no middle name
         results = fetch(["middle_name IS NULL"])
         if results:
-            return results[:limit]
+            return results
         # fall back to all matches
-        return fetch()[:limit]
+        return fetch()
