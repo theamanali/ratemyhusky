@@ -4,7 +4,7 @@ export const config: PlasmoCSConfig = {
   matches: ["https://myplan.uw.edu/course/*"],
 }
 
-const API_BASE = "http://localhost:8000"
+const API_BASE = "https://api.ratemydawg.com"
 
 const cache: Record<string, Professor[]> = {}
 
@@ -23,12 +23,12 @@ const TOOLTIPS: Record<string, { title: string; desc: string }> = {
   },
   CES: {
     title: "Course Evaluation Score",
-    desc: "Calculated by first averaging the median response across all course evaluation questions for each course section, then taking a weighted average of those section scores weighted by the number of students surveyed. Questions include: instructor contribution, effectiveness, course as a whole, content, amount learned, instructor interest, grading techniques, and up to 20 others. Scale of 1–5. Higher is better.",
+    desc: "Weighted average of median responses across all UW course evaluation questions per section, weighted by students surveyed. Scale of 0–5. Higher is better.",
   },
 }
 
-function ratingColor(value: number, reverse = false): string {
-  const t = reverse ? 1 - value / 5 : value / 5
+function ratingColor(value: number, reverse = false, min = 1, max = 5): string {
+  const t = Math.max(0, Math.min(1, reverse ? 1 - (value - min) / (max - min) : (value - min) / (max - min)))
   const r = Math.round(t < 0.5 ? 255 : 255 * (1 - t) * 2)
   const g = Math.round(t > 0.5 ? 255 : 255 * t * 2)
   return `rgb(${r}, ${g}, 0)`
@@ -49,7 +49,7 @@ function createTooltip() {
       padding: 8px 12px;
       font-size: 13px;
       font-family: 'Open Sans', sans-serif;
-      max-width: 240px;
+      max-width: 360px;
       pointer-events: none;
       z-index: 99999;
       box-shadow: 0 4px 12px rgba(0,0,0,0.12);
@@ -85,7 +85,14 @@ function createTooltip() {
     const key = pill.getAttribute("data-rmd-key")
     const info = TOOLTIPS[key]
     if (!info) return
-    tooltip.innerHTML = `<strong>${info.title}</strong><span>${info.desc}</span>`
+    const statRaw = pill.getAttribute("data-rmd-stat")
+    let statHtml = ""
+    if (statRaw) {
+      const { text, color } = JSON.parse(statRaw)
+      const [num, ...rest] = text.split(" ")
+      statHtml = `<span style="display:block; color:rgb(33,37,41); margin-bottom:4px; font-size:12px;"><span style="background:${color}; border-radius:4px; padding:1px 5px; font-weight:600; color:rgb(33,37,41); margin-right:3px;">${num}</span><span>${rest.join(" ")}</span></span>`
+    }
+    tooltip.innerHTML = `<strong>${info.title}</strong>${statHtml}<span>${info.desc}</span>`
     tooltip.style.display = "block"
   })
 
@@ -102,13 +109,15 @@ function pill(
   key: string,
   value: string | null,
   color: string | null,
-  animate = true
+  animate = true,
+  statLine: string | null = null
 ): HTMLElement {
   const bg = color ?? "rgb(180,180,180)"
   const text = value ?? "N/A"
 
   const wrapper = document.createElement("span")
   wrapper.setAttribute("data-rmd-key", key)
+  if (statLine) wrapper.setAttribute("data-rmd-stat", JSON.stringify({ text: statLine, color: bg }))
   wrapper.style.cssText =
     "display:inline-flex; align-items:center; gap:2px; font-size:11.375px; font-family:'Open Sans',sans-serif; white-space:nowrap; cursor:default;"
 
@@ -151,6 +160,9 @@ interface Professor {
   avg_difficulty_rating: number | null
   would_take_again_percent: number | null
   avg_eval_median_weighted: number | null
+  rmp_rating_count: number | null
+  cec_surveyed_count: number | null
+  cec_eval_count: number | null
 }
 
 function injectBadge(el: HTMLElement, prof: Professor, animate = true) {
@@ -164,12 +176,15 @@ function injectBadge(el: HTMLElement, prof: Professor, animate = true) {
     requestAnimationFrame(() => { badge.style.opacity = "1" })
   })
 
-  const { avg_quality_rating: qr, avg_difficulty_rating: dr, would_take_again_percent: wta, avg_eval_median_weighted: ces } = prof
+  const { avg_quality_rating: qr, avg_difficulty_rating: dr, would_take_again_percent: wta, avg_eval_median_weighted: ces, rmp_rating_count: rmpCount, cec_surveyed_count: cecCount, cec_eval_count: cecEvals } = prof
 
-  badge.appendChild(pill("QR", qr != null ? qr.toFixed(1) : null, qr != null ? ratingColor(qr) : null, animate))
-  badge.appendChild(pill("DR", dr != null ? dr.toFixed(1) : null, dr != null ? ratingColor(dr, true) : null, animate))
-  badge.appendChild(pill("WTA", wta != null ? `${wta.toFixed(0)}%` : null, wta != null ? ratingColor(wta / 20) : null, animate))
-  badge.appendChild(pill("CES", ces != null ? ces.toFixed(1) : null, ces != null ? ratingColor(ces) : null, animate))
+  const rmpSuffix = rmpCount ? ` from <b>${rmpCount}</b> reviews` : ""
+  const cecSuffix = cecCount && cecEvals ? ` calculated from <b>${cecCount}</b> surveys across <b>${cecEvals}</b> sections` : ""
+
+  badge.appendChild(pill("QR", qr != null ? qr.toFixed(1) : null, qr != null ? ratingColor(qr) : null, animate, qr != null ? `${qr.toFixed(1)} calculated${rmpSuffix}` : null))
+  badge.appendChild(pill("DR", dr != null ? dr.toFixed(1) : null, dr != null ? ratingColor(dr, true) : null, animate, dr != null ? `${dr.toFixed(1)} calculated${rmpSuffix}` : null))
+  badge.appendChild(pill("WTA", wta != null ? `${wta.toFixed(0)}%` : null, wta != null ? ratingColor(wta, false, 0, 100) : null, animate, wta != null ? `${wta.toFixed(0)}% of <b>${rmpCount}</b> reviewers would take again` : null))
+  badge.appendChild(pill("CES", ces != null ? ces.toFixed(1) : null, ces != null ? ratingColor(ces, false, 0, 5) : null, animate, ces != null ? `${ces.toFixed(1)}${cecSuffix}` : null))
 
   el.appendChild(badge)
 }
