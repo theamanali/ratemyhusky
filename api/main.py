@@ -44,7 +44,7 @@ def get_pool():
     if _pool is None:
         _pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=1,
-            maxconn=10,
+            maxconn=50,
             dsn=os.environ["DATABASE_URL"],
             sslmode="require",
         )
@@ -101,9 +101,9 @@ def health(request: Request):
     }
 
 
-@app.get("/professors/search", tags=["Professors"])
+@app.get("/professors/match", tags=["Professors"])
 @limiter.limit("30/minute")
-def search_professors(
+def match_professors(
     request: Request,
     name: str = Query(..., min_length=2),
     school: str = Query(None),
