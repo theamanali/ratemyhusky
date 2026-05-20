@@ -8,6 +8,7 @@ import psycopg2.pool
 from contextlib import contextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from nameparser import HumanName
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -65,10 +66,6 @@ def db_cursor():
         pool.putconn(conn)
 
 
-def strip_accents(s):
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-
-
 def normalize_initials(s):
     s = re.sub(r'([A-Za-z]\.)(?=[A-Za-z])', r'\1 ', s)
     parts = s.split()
@@ -82,10 +79,11 @@ def parse_name(full_name):
 
 
 def norm(s):
-    return strip_accents((s or "").lower().strip())
+    return ''.join(c for c in unicodedata.normalize('NFD', (s or "").lower().strip()) if unicodedata.category(c) != 'Mn')
 
 
 @app.get("/health", tags=["Meta"])
+@limiter.limit("30/minute")
 def health(request: Request):
     start = time.monotonic()
     try:
@@ -101,15 +99,10 @@ def health(request: Request):
     }
 
 
-@app.get("/professors/match", tags=["Professors"])
-@limiter.limit("30/minute")
-def match_professors(
-    request: Request,
-    name: str = Query(..., min_length=2),
-):
+def _match_one(name: str) -> list:
     first, middle, last = parse_name(name)
     if not first or not last:
-        raise HTTPException(status_code=400, detail="Could not parse a first and last name from the provided name")
+        return []
 
     base_filters = ["unaccent(lower(first_name)) = %s", "unaccent(lower(last_name)) = %s"]
     base_params = [norm(first), norm(last)]
@@ -128,7 +121,6 @@ def match_professors(
         results = fetch()
         if len(results) <= 1:
             return results
-        # disambiguate by middle name character by character
         query_middle = norm(middle)
         for char_count in range(1, len(query_middle) + 1):
             prefix = query_middle[:char_count]
@@ -139,9 +131,28 @@ def match_professors(
                 results = filtered
         return results
     else:
-        # prefer professors with no middle name
         results = fetch(["middle_name IS NULL"])
-        if results:
-            return results
-        # fall back to all matches
-        return fetch()
+        return results if results else fetch()
+
+
+class BatchMatchRequest(BaseModel):
+    names: list[str]
+
+
+@app.post("/professors/match/batch", tags=["Professors"])
+@limiter.limit("30/minute")
+def match_professors_batch(request: Request, body: BatchMatchRequest):
+    return {name: _match_one(name) for name in body.names}
+
+
+@app.get("/professors/match", tags=["Professors"])
+@limiter.limit("30/minute")
+def match_professors(
+    request: Request,
+    name: str = Query(..., min_length=2),
+):
+    first, middle, last = parse_name(name)
+    if not first or not last:
+        raise HTTPException(status_code=400, detail="Could not parse a first and last name from the provided name")
+
+    return _match_one(name)
